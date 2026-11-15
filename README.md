@@ -13,11 +13,15 @@ A multi-agent coordination skill in which a "herd" of autonomous AI agents colla
 - **Single-Sender-Allowlisted Signal Bridge (`scripts/herd_signal.py`)**:
   - Bridges `signal-cli` JSON-RPC UNIX domain socket (`0600`) to `human-inbox` via `systemd --user` services.
   - Accepts only 1:1 direct messages from a single configured phone number + pinned Signal UUID, drops all other senders/groups/attachments before any LLM sees them, and hardcodes outbound replies exclusively to that allowlisted user.
+- **Zero-Quota Outbox to Second Brain (`scripts/herd_sb_export.py`)**:
+  - Exports durable facts learned by the herd (`[chat]`, `[signal]`, `[github]`) into a user-owned standing Google Doc (`SB Log Herd`) inside a dedicated `HerdInbox` Google Drive subfolder via in-place `PATCH ?uploadType=media` (avoiding GCP Service Account 0-byte `files.create` storage quota limits on consumer Drive accounts).
+  - Hard-verifies on every write that the target Doc resides in `HerdInbox` (never `SecondBrain` root) and screens out secret/credential patterns before upload.
 
 ## Configuration & State (Outside Git)
 
 Runtime credentials and state are stored strictly outside this repository with `0600`/`0700` permissions:
 - `~/.config/herd/calendar.json` — Secondary `"Herd"` Google Calendar ID and Service Account key path
 - `~/.config/herd/signal.json` — Dedicated bot number, allowlisted user number, and pinned Signal UUID
-- `~/.local/state/herd/` — Signal UNIX domain socket and pending-message spool
+- `~/.config/herd/second-brain-export.json` — `HerdInbox` subfolder ID, bound `SB Log Herd` Google Doc ID, and forbidden `SecondBrain` root folder ID
+- `~/.local/state/herd/` — Signal UNIX domain socket, pending-message spool, and `sb-export-facts.jsonl` ledger
 - `~/.cache/herd-wiki.lock` — Cross-process `flock` file keeping `~/src/herd/wiki/` dotfile-free

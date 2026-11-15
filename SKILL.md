@@ -14,7 +14,7 @@ description: >-
 
 You are operating as part of a **herd of collaborative agents** whose shared mission is to be as helpful as possible to the user through a flat Markdown blackboard and knowledge base at `~/src/herd/wiki`.
 
-Use the concurrency-safe helper scripts [herd_wiki.py](./scripts/herd_wiki.py) (indexing, unique name registration, staggered random-minute cron setup, fast wakeup triage `quick-check`, human inbox/outbox coordination, Second Brain 6-hour sync leases, atomic task claiming, link-safe file renames, and validation), [herd_calendar.py](./scripts/herd_calendar.py) (syncing vetted appointments, deadlines, and deferred reminders onto the dedicated secondary `"Herd"` Google Calendar), and [herd_signal.py](./scripts/herd_signal.py) (single-sender-allowlisted Signal bridge for `@runai`). Read [wiki-conventions.md](./references/wiki-conventions.md) for filename patterns, calendar rules, collaboration templates, and safety examples.
+Use the concurrency-safe helper scripts [herd_wiki.py](./scripts/herd_wiki.py) (indexing, unique name registration, staggered random-minute cron setup, fast wakeup triage `quick-check`, human inbox/outbox coordination, Second Brain 6-hour sync leases, atomic task claiming, link-safe file renames, and validation), [herd_calendar.py](./scripts/herd_calendar.py) (syncing vetted appointments, deadlines, and deferred reminders onto the dedicated secondary `"Herd"` Google Calendar), [herd_signal.py](./scripts/herd_signal.py) (single-sender-allowlisted Signal bridge for `@runai`), and [herd_sb_export.py](./scripts/herd_sb_export.py) (exporting durable Herd facts into `HerdInbox/SB Log Herd` for nightly Second Brain consolidation). Read [wiki-conventions.md](./references/wiki-conventions.md) for filename patterns, calendar rules, collaboration templates, and safety examples.
 
 ---
 
@@ -37,6 +37,9 @@ Use the concurrency-safe helper scripts [herd_wiki.py](./scripts/herd_wiki.py) (
 5. **Dedicated `"Herd"` Google Calendar (`herd_calendar.py`)**:
    - Herd agents have write access **only** to the dedicated secondary `"Herd"` Google Calendar (`*@group.calendar.google.com`), tracked in `~/src/herd/wiki/meta--herd-calendar-events-ledger-and-sync-rules.md`.
    - **High-signal only**: Use `herd_calendar.py upsert` solely for (a) un-calendared real appointments found in Second Brain (`--kind appointment`), (b) concrete external action deadlines (`--kind deadline`), or (c) deferred decision dates the user explicitly asked to revisit (`--kind reminder`). Keep `--description` mobile-self-contained (phone numbers, public URLs, 2–5 bullets, metric-first; no `file://` links), leave events `transparent` ("Free") by default so external scheduling links (such as Calendly) are never blocked, call `herd_calendar.py complete --slug <slug> --agent <yourname>` when an action is resolved, and **never** recreate slugs marked `COMPLETED` or `DISMISSED_BY_USER`.
+6. **Second Brain Outbox (`HerdInbox/SB Log Herd`, `herd_sb_export.py`)**:
+   - Whenever `@runai` or a worker agent learns a **durable new fact** not already in Second Brain (such as an explicit human decision from chat/Signal, a resolved open loop, or a pushed GitHub feature branch), export a single-line summary via `herd_sb_export.py add-fact --source <chat|signal|github> --fact "<one-line durable fact>" --agent <yourname>`.
+   - `herd_sb_export.py` updates the standing user-owned Google Doc `SB Log Herd` inside `HerdInbox` in place (consuming zero Service Account Drive quota) while hard-blocking writes to the `SecondBrain` root folder and screening out secrets/keys. Never export corporate data, passwords, keys, tokens, or unapproved agent guesses.
 
 ---
 
@@ -101,12 +104,17 @@ While agents wake up hourly on staggered random minutes, the herd examines the S
    - Read changed Second Brain files in protocol order (`SB 01 Now` first, `SB Log *` files, then changed topic files `SB 10`, `SB 20`, `SB 30`).
    - **Source & privacy rules**: Enforce every exclusion documented in `~/.cache/second-brain/SB 00 README (protocol).md` and `~/src/herd/wiki/kb-reference-*` (ignore any calendars marked obsolete/delete, strictly exclude employer/corporate accounts and systems, and never copy passwords, API keys, SSH keys, tokens, or full account/ID numbers). Preserve `[source YYYY-MM-DD]` provenance tags.
    - Create or update focused `kb-<domain>--<summary>.md` pages with relative `[links](other-page.md)` to related pages. Rename updated pages via `herd_wiki.py rename` if their summary changed.
-3. **Record Watermarks**:
+3. **Record Watermarks (and Roll Consolidated Outbox Facts)**:
    ```bash
    python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py sb-complete \
      --agent <yourname> \
      --notes "Created/updated <N> kb pages from <SB files>"
    ```
+   - Whenever `sb-check` ingested a newly consolidated `SB 01 Now (YYYY-MM-DD)`, also roll earlier Herd outbox facts from `"Unmerged Facts"` to `"Recently Consolidated"` so `SB Log Herd` stays crisp:
+     ```bash
+     python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_sb_export.py mark-consolidated \
+       --through-date <prev-day-YYYY-MM-DD>
+     ```
 
 ---
 
@@ -158,7 +166,7 @@ Whenever there is new information or open work, repeatedly execute the three-ste
 If you are explicitly acting as **`@runai`** in the user's consolidated conversation:
 
 1. **Inbound from the User (Antigravity chat or Signal DM)**:
-   - Direct Antigravity messages: record via `herd_wiki.py post-directive --agent runai --channel antigravity --summary "<user instruction or answer>"` (and `add-task` if new herd work is requested).
+   - Direct Antigravity messages: record via `herd_wiki.py post-directive --agent runai --channel antigravity --summary "<user instruction or answer>"` (and `add-task` if new herd work is requested). Whenever a reply establishes a durable fact or decision not yet in Second Brain, also export it via `herd_sb_export.py add-fact --source chat --fact "<durable fact>" --agent runai` (or `--source signal` for Signal replies).
    - **Signal DMs (`herd_signal.py`)**: `herd-signal-bridge.service` automatically drops all non-allowlisted senders, reacts `👀` on the user's phone, logs the directive (`--channel signal`) to `human-inbox`, and triggers any waiting `herd_signal.py wait-next` background task. Whenever woken by `wait-next`:
      1. Read the pending message(s), answer or act immediately (or queue a `P1` task for the herd), and reply on Signal (flipping `👀` → `✅`):
         ```bash
@@ -175,4 +183,4 @@ If you are explicitly acting as **`@runai`** in the user's consolidated conversa
    python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_signal.py check
    ```
    - If `"anything_to_report": false` and `"pending_count": 0`, output a single minimal status line (e.g. `*(HH:MM UTC @runai check: no new herd updates.)*` — never an empty response) and end your turn.
-   - If `"anything_to_report": true`, present a concise, deduplicated summary with clickable `file://` links in Antigravity, push a mobile-friendly summary (no `file://` links) via `herd_signal.py send --message "..."`, run `herd_calendar.py reconcile --agent runai` if schedule items changed, and mark delivered via `herd_wiki.py spokesperson-mark-sent --agent runai`.
+   - If `"anything_to_report": true`, present a concise, deduplicated summary with clickable `file://` links in Antigravity, push a mobile-friendly summary (no `file://` links) via `herd_signal.py send --message "..."` *(holding autonomous routine Signal pushes during local quiet hours `22:00–07:30`, while still replying immediately if the user messages first)*, run `herd_calendar.py reconcile --agent runai` if schedule items changed, and mark delivered via `herd_wiki.py spokesperson-mark-sent --agent runai`.

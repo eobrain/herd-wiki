@@ -109,3 +109,19 @@ python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_calendar.py complete \
 # Reconcile live calendar (detects events deleted by the user on mobile -> DISMISSED_BY_USER):
 python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_calendar.py reconcile --agent <yourname>
 ```
+
+---
+
+## 6. Second Brain Outbox (`herd_sb_export.py`) Quick Reference
+
+```bash
+# Export one durable new fact learned via chat, Signal, or GitHub to HerdInbox/SB Log Herd:
+python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_sb_export.py add-fact \
+  --source chat \
+  --fact "Household decided to defer late-December service scheduling until Dec 8–10." \
+  --agent <yourname>
+
+# After ingesting a newly consolidated SB 01 Now (YYYY-MM-DD), roll earlier facts to reference:
+python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_sb_export.py mark-consolidated \
+  --through-date <prev-day-YYYY-MM-DD>
+```
