@@ -4,9 +4,9 @@ A multi-agent coordination skill in which a "herd" of autonomous AI agents colla
 
 ## Key Capabilities
 
-- **Flat Summary-Named Wiki (`scripts/herd_wiki.py`)**:
+- **Flat Summary-Named Wiki & Longitudinal Telemetry (`scripts/herd_wiki.py`)**:
   - Every wiki page lives in one flat directory (`<category>--<kebab-case-summary>.md`, `<= 200` bytes, zero subdirectories) so agents can select context purely from filenames (`herd_wiki.py index`) without bloating their context window.
-  - `flock`-serialized agent registration with declared runtime/model/effort & capability tiers (`T1`–`T3`), collision-free OS-random hourly wakeup minutes (`<M> * * * *`), read-only wakeup triage (`quick-check`), 6-hour Second Brain sync leases, `[needs-gemini: ...]` & `> 48h` Gemini-source lag watchdog (`sb-watchdog` / `spokesperson-check`), atomic task claiming + two-agent Maker–Checker peer review (`NEEDS_REVIEW` → `IN_REVIEW` → `DONE`, holding `@runai` delivery until verified or 90-minute fallback), link-rewriting renames, and link/filename validation.
+  - `flock`-serialized agent registration with declared runtime/model/effort & capability tiers (`T1`–`T3`), collision-free OS-random hourly wakeup minutes (`<M> * * * *`), read-only wakeup triage (`quick-check`), 6-hour Second Brain sync leases, `[needs-gemini: ...]` & `> 48h` Gemini-source lag watchdog (`sb-watchdog` / `spokesperson-check`), atomic task claiming + two-agent Maker–Checker peer review (`NEEDS_REVIEW` → `IN_REVIEW` → `DONE`, holding `@runai` delivery until verified or 90-minute fallback), automated 30-day usefulness & quality telemetry (`metrics-init`, `record-outcome`, `metrics-report`), link-rewriting renames, and link/filename validation.
 - **Dedicated Secondary `"Herd"` Google Calendar (`scripts/herd_calendar.py`)**:
   - Pure Python 3.12 + `cryptography` RS256 Service Account JWT integration (no extra `pip` packages required).
   - Structurally restricted to secondary Google Calendars (`*@group.calendar.google.com`) so agents can never write to primary personal or corporate calendars; defaults reminders to `transparent` ("Free") and respects mobile dismissals (`DISMISSED_BY_USER`).
@@ -16,8 +16,8 @@ A multi-agent coordination skill in which a "herd" of autonomous AI agents colla
 - **Zero-Quota Outbox to Second Brain (`scripts/herd_sb_export.py`)**:
   - Exports durable facts learned by the herd (`[chat]`, `[signal]`, `[github]`) into a user-owned standing Google Doc (`SB Log Herd`) inside a dedicated `HerdInbox` Google Drive subfolder via in-place `PATCH ?uploadType=media` (avoiding GCP Service Account 0-byte `files.create` storage quota limits on consumer Drive accounts).
   - Hard-verifies on every write that the target Doc resides in `HerdInbox` (never `SecondBrain` root) and screens out secret/credential patterns before upload.
-- **Zero-Idle-Token Claude Code Worker Runner (`scripts/herd_claude_worker.py`)**:
-  - Registers Claude Code worker peers (`@<name>`) with staggered hourly `systemd --user` timers (`*-*-* *:<MM>:00`) that execute `herd_wiki.py quick-check` in pure Python (`~50 ms`, `0` LLM tokens) and only invoke `claude -p` when `"action_needed": true`.
+- **Zero-Idle-Token Worker Gatekeepers (`scripts/herd_agy_worker.py` & `scripts/herd_claude_worker.py`)**:
+  - Registers Antigravity CLI (`agy`) and Claude Code (`claude`) worker peers (`@<name>`) with staggered hourly `systemd --user` timers (`*-*-* *:<MM>:00`) that execute `herd_wiki.py quick-check --external-gatekeeper` in pure Python (`~50 ms`, `0` LLM tokens) and only spawn a fresh, short-context `agy -p` / `claude -p` turn when `"action_needed": true` — eliminating hourly cold-KV-cache prefill drag on persistent chat tabs.
 
 ## Configuration & State (Outside Git)
 

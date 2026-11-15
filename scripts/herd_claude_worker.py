@@ -98,8 +98,11 @@ def save_worker_cfg(agent: str, cfg: dict) -> Path:
 
 
 def run_wiki_cmd(*cmd_args: str, wiki_dir: Path) -> dict:
+    child_env = dict(os.environ)
+    child_env["HERD_EXTERNAL_GATEKEEPER"] = "1"
     proc = subprocess.run(
         [sys.executable, str(HERD_WIKI_PY), "--wiki-dir", str(wiki_dir), *cmd_args],
+        env=child_env,
         capture_output=True,
         text=True,
         timeout=60,
@@ -273,6 +276,7 @@ Type=oneshot
 UMask=0077
 WorkingDirectory={herd_dir}
 Environment="PATH={path_env}"
+Environment="HERD_EXTERNAL_GATEKEEPER=1"
 ExecStart=/usr/bin/python3 {script_abs} tick --agent {agent}
 TimeoutStartSec=900
 """
@@ -336,10 +340,27 @@ def cmd_tick(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": True, "agent": agent, "skipped": "locked"}, indent=2))
             return 0
 
-        qc_before = run_wiki_cmd("quick-check", "--agent", agent, wiki_dir=wiki_dir)
+        model_val = cfg.get("model", "sonnet")
+        effort_val = cfg.get("effort", "high")
+        qc_before = run_wiki_cmd(
+            "quick-check", "--agent", agent, "--external-gatekeeper", wiki_dir=wiki_dir
+        )
         action_needed = bool(qc_before.get("action_needed"))
 
         if not action_needed and not args.force:
+            if not args.dry_run:
+                run_wiki_cmd(
+                    "record-gatekeeper-tick",
+                    "--agent",
+                    agent,
+                    "--runtime",
+                    "claude-code",
+                    "--model",
+                    model_val,
+                    "--effort",
+                    effort_val,
+                    wiki_dir=wiki_dir,
+                )
             append_log(agent, "idle: quick-check action_needed=false (0 Claude tokens used)")
             print(
                 json.dumps(
@@ -357,8 +378,6 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
         prompt = build_tick_prompt(agent, qc_before, cfg)
         allowed_tools = build_allowed_tools(herd_dir)
-        model_val = cfg.get("model", "sonnet")
-        effort_val = cfg.get("effort", "high")
         cmd = [
             str(CLAUDE_BIN),
             "-p",
@@ -395,12 +414,28 @@ def cmd_tick(args: argparse.Namespace) -> int:
             )
             return 0
 
+        run_wiki_cmd(
+            "record-gatekeeper-tick",
+            "--agent",
+            agent,
+            "--runtime",
+            "claude-code",
+            "--model",
+            model_val,
+            "--effort",
+            effort_val,
+            "--invoked",
+            wiki_dir=wiki_dir,
+        )
         reasons_str = ",".join(qc_before.get("reasons", [])) or ("forced" if args.force else "unknown")
         append_log(agent, f"waking Claude ({model_val}@{effort_val}) for reasons=[{reasons_str}]")
 
+        child_env = dict(os.environ)
+        child_env["HERD_EXTERNAL_GATEKEEPER"] = "1"
         proc = subprocess.run(
             cmd,
             cwd=str(herd_dir),
+            env=child_env,
             capture_output=True,
             text=True,
             timeout=840,
@@ -424,7 +459,9 @@ def cmd_tick(args: argparse.Namespace) -> int:
             return proc.returncode
 
         # Safety watermark post-hook: ensure idle heartbeat advances if Claude left no IN_PROGRESS / IN_REVIEW task
-        qc_after = run_wiki_cmd("quick-check", "--agent", agent, wiki_dir=wiki_dir)
+        qc_after = run_wiki_cmd(
+            "quick-check", "--agent", agent, "--external-gatekeeper", wiki_dir=wiki_dir
+        )
         hb_advanced = qc_after.get("last_heartbeat_utc") != qc_before.get("last_heartbeat_utc")
         if (
             not hb_advanced

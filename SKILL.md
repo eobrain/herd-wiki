@@ -14,7 +14,7 @@ description: >-
 
 You are operating as part of a **herd of collaborative agents** whose shared mission is to be as helpful as possible to the user through a flat Markdown blackboard and knowledge base at `~/src/herd/wiki`.
 
-Use the concurrency-safe helper scripts [herd_wiki.py](./scripts/herd_wiki.py) (indexing, unique name registration, staggered random-minute cron setup, fast wakeup triage `quick-check`, human inbox/outbox coordination, Second Brain 6-hour sync leases, atomic task claiming, link-safe file renames, and validation), [herd_calendar.py](./scripts/herd_calendar.py) (syncing vetted appointments, deadlines, and deferred reminders onto the dedicated secondary `"Herd"` Google Calendar), [herd_signal.py](./scripts/herd_signal.py) (single-sender-allowlisted Signal bridge for `@runai`), [herd_sb_export.py](./scripts/herd_sb_export.py) (exporting durable Herd facts into `HerdInbox/SB Log Herd` for nightly Second Brain consolidation), and [herd_claude_worker.py](./scripts/herd_claude_worker.py) (zero-idle-token `systemd --user` hourly runner for Claude Code herd workers). Read [wiki-conventions.md](./references/wiki-conventions.md) for filename patterns, calendar rules, collaboration templates, and safety examples.
+Use the concurrency-safe helper scripts [herd_wiki.py](./scripts/herd_wiki.py) (indexing, unique name registration, staggered random-minute cron setup, fast wakeup triage `quick-check`, human inbox/outbox coordination, Second Brain 6-hour sync leases, atomic task claiming, two-agent Maker–Checker review, 30-day usefulness & quality telemetry `metrics-report`, link-safe file renames, and validation), [herd_calendar.py](./scripts/herd_calendar.py) (syncing vetted appointments, deadlines, and deferred reminders onto the dedicated secondary `"Herd"` Google Calendar), [herd_signal.py](./scripts/herd_signal.py) (single-sender-allowlisted Signal bridge for `@runai`), [herd_sb_export.py](./scripts/herd_sb_export.py) (exporting durable Herd facts into `HerdInbox/SB Log Herd` for nightly Second Brain consolidation), [herd_agy_worker.py](./scripts/herd_agy_worker.py) (zero-idle-token `systemd --user` hourly runner for Antigravity CLI `agy` workers), and [herd_claude_worker.py](./scripts/herd_claude_worker.py) (zero-idle-token `systemd --user` hourly runner for Claude Code workers). Read [wiki-conventions.md](./references/wiki-conventions.md) for filename patterns, calendar rules, collaboration templates, and safety examples.
 
 ---
 
@@ -63,30 +63,30 @@ Before writing to the wiki or coordinating with peers (once per agent session/id
 2. This creates your `agent-<yourname>--*.md` presence page, assigns an OS-random wakeup minute, and adds you to the roster.
 3. **Always identify yourself as `@<yourname>`** (with a UTC timestamp) in every edit to `collab--*.md`, `board--*.md`, presence cards, outbox items, and deliverables.
 
-### 2.2 Configure Frequent Wakeups at Your Own Random Minute (`<M> * * * *`)
-Agents must **not** all share `0 */6 * * *`. Instead, each worker agent wakes up **once every hour at its own random minute `<M>`** (`0`–`59`) to take a quick look for work:
+### 2.2 Configure Frequent Wakeups via Zero-Idle-Token Gatekeepers (`<M> * * * *`)
+Worker agents wake up **once every hour at their own collision-free random minute `<M>`** (`0`–`59`) via external OS-level `systemd --user` gatekeepers so idle checks spend **0 LLM tokens** (avoiding hourly cold-KV-cache prefill of long chat transcripts):
 
-1. **Generate (or retrieve) your collision-free random minute** using OS randomness — do **not** pick a number in your head:
-   ```bash
-   python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py random-cron --agent <yourname>
-   ```
-2. **Register your hourly wakeup schedule (unless managed externally by `herd_claude_worker.py` `systemd --user` timer)**:
-   - **Antigravity sessions**: Run `manage_task` (`Action: "list"`), kill any older `0 */6 * * *` or duplicate cron task, and call `schedule` once with `CronExpression: "<M> * * * *"` and `ExactTiming: false`.
-   - **Claude Code interactive / `--bg` sessions**: Check `CronList`, delete any duplicate schedule via `CronDelete`, and call `CronCreate` with `"<M> * * * *"` to run `herd_wiki.py quick-check --agent <yourname>` hourly.
-   - **`systemd --user` zero-idle-token workers (`herd_claude_worker.py`)**: Your `herd-claude-<yourname>.timer` already runs `quick-check` in Python every hour at minute `<M>` and only invokes `claude -p` when `"action_needed": true` — do **not** create an in-session cron.
+1. **Standard Zero-Idle-Token Worker Setup (`systemd --user`)**:
+   - **Antigravity CLI (`agy`) workers**: Install via `python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_agy_worker.py install --agent <yourname> --model <agy-model-id>` (e.g., `gemini-4-carbon-high`, `gemini-4-argon-medium`, `gemini-4-hydrogen-high`, `gemini-3.8-flash-medium`).
+   - **Claude Code (`claude`) workers**: Install via `python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_claude_worker.py install --agent <yourname> --model <sonnet|opus> --effort <low|medium|high|xhigh|max>`.
+   - Both runners execute `herd_wiki.py quick-check --agent <yourname> --external-gatekeeper` in pure Python (`~50 ms`, `0` tokens) every hour at minute `<M>` and only spawn a fresh, stateless `agy -p` / `claude -p` turn when `"action_needed": true`. **Never** call `schedule` or `CronCreate` inside a `systemd`-managed worker turn.
+2. **Legacy In-Session Worker Crons (Deprecated)**:
+   - Persistent in-session worker crons (`schedule` in Antigravity or `CronCreate` in Claude Code) are retired because 60-minute wakeups exceed prompt KV-cache TTLs. Only `@runai`'s consolidated spokesperson daemon (`8,38 * * * *`) runs in-session.
 
 ---
 
 ## 3. Step 2: Fast Wakeup Triage ("Quick Look, Back to Waiting If Nothing Is New")
 
-Whenever your `<M> * * * *` cron wakes you up, **do NOT read wiki files or rewrite your heartbeat upfront**. First take a single fast, read-only look:
+Whenever a wakeup occurs, **do NOT read wiki files or rewrite your heartbeat upfront**. First take a single fast, read-only look:
 
 ```bash
 python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py quick-check --agent <yourname>
 ```
 
+- **If `"retire_in_session_cron": true`**:
+   - Your worker polling is now handled externally by a zero-idle-token `systemd` gatekeeper. Immediately call `manage_task` (`Action: "list"`), call `manage_task` (`Action: "kill"`) on **every** active `schedule` / cron background task in your conversation, touch **zero** wiki files, do **not** schedule a new cron, and end your turn immediately.
 - **If `"action_needed": false`**:
-   - Nothing new needs doing (no new human directives, the 6-hour Second Brain window is not due, there are no `OPEN` or stale `IN_PROGRESS` tasks on the board, and no `kb-*` or `collab--*` pages changed since your last heartbeat).
+   - Nothing new needs doing (no new human directives, the 6-hour Second Brain window is not due, there are no `OPEN` or `NEEDS_REVIEW` tasks on the board, and no `collab--*` discussions changed since your last heartbeat).
    - **Do NOT touch any wiki files** (updating your presence file when idle creates unnecessary file-mtime noise). End your turn immediately (call no more tools) and go right back to waiting!
 - **If `"action_needed": true`**:
    - Inspect **only** the specific triggers listed in `reasons` (`skill_updated`, `human_inbox_updated`, `own_in_review_tasks`, `review_tasks`, `stale_in_review_tasks`, `sb_sync_due`, `open_tasks`, `stale_in_progress_tasks`, or `updated_wiki_files`):
@@ -197,7 +197,7 @@ Whenever `quick-check` lists `review_tasks` (or `own_in_review_tasks` / `stale_i
 If you are explicitly acting as **`@runai`** in the user's consolidated conversation:
 
 1. **Inbound from the User (Antigravity chat or Signal DM)**:
-   - Direct Antigravity messages: record via `herd_wiki.py post-directive --agent runai --channel antigravity --summary "<user instruction or answer>"` (and `add-task` if new herd work is requested). Whenever a reply establishes a durable fact or decision not yet in Second Brain, also export it via `herd_sb_export.py add-fact --source chat --fact "<durable fact>" --agent runai` (or `--source signal` for Signal replies).
+   - Direct Antigravity messages: record via `herd_wiki.py post-directive --agent runai --channel antigravity --summary "<user instruction or answer>"` (passing `--resolves <M-NNN> --outcome <acted|passed|deferred|dismissed>` whenever the user's message acts on, passes on, defers, or dismisses a delivered outbox item; for Signal replies where `herd-signal-bridge` already logged `D-NNN`, run `herd_wiki.py record-outcome --message-id <M-NNN> --directive-id <D-NNN> --outcome <...>`). Add tasks via `add-task` if new herd work is requested. Whenever a reply establishes a durable fact or decision not yet in Second Brain, also export it via `herd_sb_export.py add-fact --source chat --fact "<durable fact>" --agent runai` (or `--source signal` for Signal replies).
    - **Signal DMs (`herd_signal.py`)**: `herd-signal-bridge.service` automatically drops all non-allowlisted senders, reacts `👀` on the user's phone, logs the directive (`--channel signal`) to `human-inbox`, and triggers any waiting `herd_signal.py wait-next` background task. Whenever woken by `wait-next`:
      1. Read the pending message(s), answer or act immediately (or queue a `P1` task for the herd), and reply on Signal (flipping `👀` → `✅`):
         ```bash

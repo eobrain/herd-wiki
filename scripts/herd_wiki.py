@@ -33,11 +33,16 @@ DEFAULT_SB_SYNC_SCRIPT = Path(
 DEFAULT_LOCK_PATH = Path(
     os.environ.get("HERD_WIKI_LOCK", str(Path.home() / ".cache/herd-wiki.lock"))
 )
+DEFAULT_STATE_DIR = Path(
+    os.environ.get("HERD_SIGNAL_STATE_DIR", str(Path.home() / ".local/state/herd"))
+)
+ESTIMATED_IDLE_WAKEUP_TOKENS = 160_000
 
 ROSTER_FILE = "meta--herd-agent-roster-active-names-heartbeats-and-presence-index.md"
 SB_LEDGER_FILE = (
     "meta--second-brain-sync-ledger-four-times-daily-schedule-and-source-watermarks.md"
 )
+METRICS_LEDGER_FILE = "meta--herd-quality-and-usefulness-metrics-ledger.md"
 DEFAULT_BOARD_FILE = "board--prioritized-helpful-tasks-and-agent-assignments.md"
 CONVENTIONS_FILE = (
     "meta--herd-wiki-conventions-flat-summary-filenames-and-blackboard-protocol.md"
@@ -390,14 +395,16 @@ def parse_agent_cards(wiki_dir: Path) -> dict[str, dict[str, Any]]:
 def pick_random_cron(
     wiki_dir: Path, exclude_agent: str | None = None
 ) -> tuple[int, str]:
-    """Pick a true OS-random minute (0..59) avoiding minutes used by peers when possible."""
+    """Pick a true OS-random minute (0..59) avoiding minutes used by active peers when possible."""
     used_minutes: set[int] = set()
     for name, info in parse_agent_cards(wiki_dir).items():
         if exclude_agent and name == exclude_agent:
             continue
+        if info.get("status") == "retired":
+            continue
         cron_str = info.get("wakeup_cron", "")
-        # Ignore legacy '0 */6 * * *' when checking staggered hourly minutes
-        if cron_str and "*/6" not in cron_str:
+        # Ignore legacy '0 */6 * * *' or retired markers when checking staggered hourly minutes
+        if cron_str and "*/6" not in cron_str and "retired" not in cron_str.lower():
             m = re.match(r"^(\d{1,2})\s+\*", cron_str)
             if m:
                 val = int(m.group(1))
@@ -421,7 +428,11 @@ def sync_roster_table(wiki_dir: Path) -> None:
     if not agents:
         lines.append("| *(none yet)* | — | — | — | — |")
     else:
-        for name in sorted(agents):
+        ordered = sorted(
+            agents,
+            key=lambda n: (1 if agents[n].get("status") == "retired" else 0, n),
+        )
+        for name in ordered:
             info = agents[name]
             fn = info["filename"]
             lines.append(
@@ -441,7 +452,7 @@ def collect_taken_names(wiki_dir: Path) -> set[str]:
     taken = set(parse_agent_cards(wiki_dir).keys())
     ignored_tokens = {
         "open", "done", "p1", "p2", "p3", "active", "idle", "working",
-        "reviewing", "coordinating", "none", "verified", "corrected",
+        "reviewing", "coordinating", "retired", "none", "verified", "corrected",
         "unspecified", "antigravity", "sonnet", "opus", "haiku", "flash",
         "hydrogen", "argon", "carbon", "low", "medium", "high", "xhigh",
         "max", "t1", "t2", "t3",
@@ -455,6 +466,432 @@ def collect_taken_names(wiki_dir: Path) -> set[str]:
                 if not cand.startswith("t-") and cand not in ignored_tokens:
                     taken.add(cand)
     return taken
+
+
+def _state_dir_from_args(args: argparse.Namespace | None = None) -> Path:
+    if args is not None and getattr(args, "state_dir", None) is not None:
+        return Path(args.state_dir)
+    return DEFAULT_STATE_DIR
+
+
+def load_gatekeeper_metrics(state_dir: Path | None = None) -> dict[str, Any]:
+    sdir = state_dir or DEFAULT_STATE_DIR
+    mpath = sdir / "gatekeeper-metrics.json"
+    default_obj: dict[str, Any] = {
+        "idle_ticks_skipped": 0,
+        "active_ticks_invoked": 0,
+        "agents": {},
+        "retired_in_session_agents": {},
+        "updated_utc": None,
+    }
+    if not mpath.exists():
+        return default_obj
+    try:
+        loaded = json.loads(mpath.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            default_obj.update(loaded)
+    except Exception:
+        pass
+    return default_obj
+
+
+def update_gatekeeper_metrics(
+    state_dir: Path | None = None,
+    *,
+    tick_agent: str | None = None,
+    runtime: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    invoked: bool = False,
+    retired_in_session_agent: str | None = None,
+) -> dict[str, Any]:
+    sdir = state_dir or DEFAULT_STATE_DIR
+    sdir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(sdir, 0o700)
+    except OSError:
+        pass
+    lock_p = sdir / "gatekeeper-metrics.lock"
+    mpath = sdir / "gatekeeper-metrics.json"
+    now_str = iso_utc()
+    with FileLock(lock_p):
+        data = load_gatekeeper_metrics(sdir)
+        if tick_agent:
+            ag = tick_agent.lower().strip()
+            agents_map = data.setdefault("agents", {})
+            entry = agents_map.setdefault(
+                ag,
+                {
+                    "runtime": runtime or "unspecified",
+                    "model": model or "unspecified",
+                    "effort": effort or "unspecified",
+                    "idle_ticks_skipped": 0,
+                    "active_ticks_invoked": 0,
+                    "last_tick_utc": None,
+                },
+            )
+            if runtime:
+                entry["runtime"] = runtime
+            if model:
+                entry["model"] = model
+            if effort:
+                entry["effort"] = effort
+            entry["last_tick_utc"] = now_str
+            if invoked:
+                data["active_ticks_invoked"] = int(data.get("active_ticks_invoked") or 0) + 1
+                entry["active_ticks_invoked"] = int(entry.get("active_ticks_invoked") or 0) + 1
+            else:
+                data["idle_ticks_skipped"] = int(data.get("idle_ticks_skipped") or 0) + 1
+                entry["idle_ticks_skipped"] = int(entry.get("idle_ticks_skipped") or 0) + 1
+        if retired_in_session_agent:
+            rag = retired_in_session_agent.lower().strip()
+            rmap = data.setdefault("retired_in_session_agents", {})
+            rec = rmap.get(rag)
+            if isinstance(rec, dict):
+                rec["count"] = int(rec.get("count") or 1) + 1
+                rec["last_seen_utc"] = now_str
+            else:
+                rmap[rag] = {
+                    "first_retired_utc": rec if isinstance(rec, str) else now_str,
+                    "last_seen_utc": now_str,
+                    "count": 1,
+                }
+        data["updated_utc"] = now_str
+        tmp = mpath.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(mpath)
+        return data
+
+
+def is_external_gatekeeper_call(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "external_gatekeeper", False)
+        or os.environ.get("HERD_EXTERNAL_GATEKEEPER") == "1"
+    )
+
+
+def should_retire_in_session_cron(
+    args: argparse.Namespace, wiki_dir: Path, agent: str | None
+) -> bool:
+    if not agent or agent.lower().strip() == "runai":
+        return False
+    if is_external_gatekeeper_call(args) or getattr(args, "allow_in_session_cron", False):
+        return False
+    if getattr(args, "enforce_external_gatekeeper", False):
+        return True
+    try:
+        return wiki_dir.resolve() == DEFAULT_WIKI_DIR.resolve()
+    except OSError:
+        return False
+
+
+METRICS_SUMMARY_START = "<!-- METRICS_SUMMARY_START -->"
+METRICS_SUMMARY_END = "<!-- METRICS_SUMMARY_END -->"
+METRICS_JSON_START = "<!-- METRICS_JSON_START -->"
+METRICS_JSON_END = "<!-- METRICS_JSON_END -->"
+
+
+def default_metrics_state() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "evaluation_started_utc": iso_utc(),
+        "window_days": 30,
+        "pre_maker_checker_baseline": {},
+        "reviews": [],
+        "outbox_items": {},
+        "directives": {},
+    }
+
+
+def load_metrics_state(wiki_dir: Path) -> dict[str, Any] | None:
+    mpath = wiki_dir / METRICS_LEDGER_FILE
+    if not mpath.exists():
+        return None
+    text = mpath.read_text(encoding="utf-8")
+    raw = extract_between_markers(text, METRICS_JSON_START, METRICS_JSON_END)
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+    parsed = json.loads(raw) if raw else {}
+    state = default_metrics_state()
+    if isinstance(parsed, dict):
+        state.update(parsed)
+    return state
+
+
+def compute_metrics_report(
+    state: dict[str, Any],
+    gatekeeper: dict[str, Any],
+    *,
+    window_days: int = 30,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    ref_now = now or utc_now()
+    cutoff = ref_now - dt.timedelta(days=window_days)
+
+    reviews_all: list[dict[str, Any]] = list(state.get("reviews") or [])
+    reviews = [
+        r
+        for r in reviews_all
+        if (parse_iso_utc(str(r.get("utc") or "")) or ref_now) >= cutoff
+    ]
+
+    peer_reviews = [
+        r for r in reviews if r.get("verdict") in ("verified", "corrected")
+    ]
+    verified_n = sum(1 for r in peer_reviews if r.get("verdict") == "verified")
+    corrected_n = sum(1 for r in peer_reviews if r.get("verdict") == "corrected")
+    skipped_n = sum(1 for r in reviews if r.get("verdict") == "skipped")
+    timeout_n = sum(1 for r in reviews if r.get("verdict") == "timeout_unreviewed")
+    total_pr = len(peer_reviews)
+    intercept_pct = round(100.0 * corrected_n / total_pr, 1) if total_pr else None
+
+    turnarounds = sorted(
+        float(r["turnaround_minutes"])
+        for r in peer_reviews
+        if r.get("turnaround_minutes") is not None
+    )
+    mean_turn = round(sum(turnarounds) / len(turnarounds), 1) if turnarounds else None
+    if turnarounds:
+        mid_i = len(turnarounds) // 2
+        median_turn = (
+            round(turnarounds[mid_i], 1)
+            if len(turnarounds) % 2 == 1
+            else round((turnarounds[mid_i - 1] + turnarounds[mid_i]) / 2.0, 1)
+        )
+    else:
+        median_turn = None
+
+    by_tier: dict[str, dict[str, Any]] = {}
+    for tier_num in (1, 2, 3):
+        t_items = [r for r in peer_reviews if int(r.get("author_tier") or 2) == tier_num]
+        t_corr = sum(1 for r in t_items if r.get("verdict") == "corrected")
+        by_tier[f"T{tier_num}"] = {
+            "reviews": len(t_items),
+            "corrected": t_corr,
+            "intercept_rate_pct": round(100.0 * t_corr / len(t_items), 1)
+            if t_items
+            else None,
+        }
+
+    by_pairing: dict[str, dict[str, Any]] = {}
+    for key_label, pred in (
+        ("cross_family", lambda r: bool(r.get("cross_family"))),
+        (
+            "same_family",
+            lambda r: not bool(r.get("cross_family"))
+            and r.get("author_family", "unspecified") != "unspecified"
+            and r.get("reviewer_family", "unspecified") != "unspecified",
+        ),
+        (
+            "unspecified_family",
+            lambda r: r.get("author_family", "unspecified") == "unspecified"
+            or r.get("reviewer_family", "unspecified") == "unspecified",
+        ),
+    ):
+        p_items = [r for r in peer_reviews if pred(r)]
+        p_corr = sum(1 for r in p_items if r.get("verdict") == "corrected")
+        by_pairing[key_label] = {
+            "reviews": len(p_items),
+            "corrected": p_corr,
+            "intercept_rate_pct": round(100.0 * p_corr / len(p_items), 1)
+            if p_items
+            else None,
+        }
+
+    outbox_items: dict[str, dict[str, Any]] = dict(state.get("outbox_items") or {})
+    delivered_actionable: list[dict[str, Any]] = []
+    for item in outbox_items.values():
+        if item.get("kind", "deliverable") not in ("deliverable", "question", "deadline"):
+            continue
+        deliv_dt = parse_iso_utc(str(item.get("delivered_utc") or ""))
+        if deliv_dt is None or deliv_dt < cutoff:
+            continue
+        delivered_actionable.append(item)
+
+    acted_n = 0
+    passed_n = 0
+    deferred_n = 0
+    dismissed_n = 0
+    awaiting_7d_n = 0
+    expired_7d_n = 0
+    closed_within_7d_n = 0
+
+    for item in delivered_actionable:
+        outcome = str(item.get("outcome") or "awaiting").lower()
+        deliv_dt = parse_iso_utc(str(item.get("delivered_utc") or "")) or ref_now
+        age_hours = (ref_now - deliv_dt).total_seconds() / 3600.0
+        conv_h = item.get("conversion_hours")
+        if outcome == "acted":
+            acted_n += 1
+            if conv_h is None or float(conv_h) <= 168.0:
+                closed_within_7d_n += 1
+        elif outcome == "passed":
+            passed_n += 1
+            if conv_h is None or float(conv_h) <= 168.0:
+                closed_within_7d_n += 1
+        elif outcome == "deferred":
+            deferred_n += 1
+            if conv_h is None or float(conv_h) <= 168.0:
+                closed_within_7d_n += 1
+        elif outcome == "dismissed":
+            dismissed_n += 1
+        else:
+            if age_hours >= 168.0:
+                expired_7d_n += 1
+            else:
+                awaiting_7d_n += 1
+
+    deliv_total = len(delivered_actionable)
+    closed_total = acted_n + passed_n + deferred_n
+    eval_7d_denom = closed_total + dismissed_n + expired_7d_n
+
+    idle_skipped = int(gatekeeper.get("idle_ticks_skipped") or 0)
+    active_invoked = int(gatekeeper.get("active_ticks_invoked") or 0)
+    total_ticks = idle_skipped + active_invoked
+    retired_map = dict(gatekeeper.get("retired_in_session_agents") or {})
+
+    return {
+        "generated_utc": iso_utc(ref_now),
+        "evaluation_started_utc": state.get("evaluation_started_utc"),
+        "window_days": window_days,
+        "maker_checker": {
+            "total_peer_reviews": total_pr,
+            "verified_as_is": verified_n,
+            "corrected_in_place": corrected_n,
+            "defect_intercept_rate_pct": intercept_pct,
+            "skipped_reviews": skipped_n,
+            "unreviewed_timeouts": timeout_n,
+            "mean_turnaround_minutes": mean_turn,
+            "median_turnaround_minutes": median_turn,
+            "by_author_tier": by_tier,
+            "by_pairing": by_pairing,
+            "pre_maker_checker_baseline": state.get("pre_maker_checker_baseline") or {},
+        },
+        "action_conversion": {
+            "delivered_actionable_count": deliv_total,
+            "acted_count": acted_n,
+            "passed_decision_count": passed_n,
+            "deferred_decision_count": deferred_n,
+            "dismissed_count": dismissed_n,
+            "awaiting_within_7d_count": awaiting_7d_n,
+            "expired_unacted_7d_count": expired_7d_n,
+            "closed_decision_count": closed_total,
+            "closed_within_7d_count": closed_within_7d_n,
+            "acr_all_delivered_pct": round(100.0 * closed_total / deliv_total, 1)
+            if deliv_total
+            else None,
+            "acr_resolved_or_7d_pct": round(100.0 * closed_total / eval_7d_denom, 1)
+            if eval_7d_denom
+            else None,
+            "strict_acted_pct": round(100.0 * acted_n / deliv_total, 1)
+            if deliv_total
+            else None,
+            "target_acr_pct": 60.0,
+        },
+        "gatekeeper": {
+            "idle_ticks_skipped": idle_skipped,
+            "active_ticks_invoked": active_invoked,
+            "idle_skip_rate_pct": round(100.0 * idle_skipped / total_ticks, 1)
+            if total_ticks
+            else None,
+            "estimated_uncached_tokens_saved": idle_skipped * ESTIMATED_IDLE_WAKEUP_TOKENS,
+            "retired_in_session_count": len(retired_map),
+            "retired_in_session_agents": retired_map,
+            "per_agent": gatekeeper.get("agents") or {},
+        },
+    }
+
+
+def _fmt_pct(val: float | None) -> str:
+    return f"{val:.1f}%" if val is not None else "—"
+
+
+def render_metrics_summary_markdown(report: dict[str, Any]) -> str:
+    mc = report["maker_checker"]
+    ac = report["action_conversion"]
+    gk = report["gatekeeper"]
+    bt = mc["by_author_tier"]
+    bp = mc["by_pairing"]
+
+    lines = [
+        f"- **Last Updated (UTC)**: `{report['generated_utc']}` (rolling `{report['window_days']}`-day window since `{report.get('evaluation_started_utc') or '—'}`)",
+        "",
+        "### 1. Maker–Checker Peer Verification (`NEEDS_REVIEW` → `DONE`)",
+        "",
+        "| Cohort | Peer Reviews | Verified As-Is | Corrected in Place | Defect Intercept Rate | Median Turnaround |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: |",
+        f"| **All Peer Reviews** | `{mc['total_peer_reviews']}` | `{mc['verified_as_is']}` | `{mc['corrected_in_place']}` | **`{_fmt_pct(mc['defect_intercept_rate_pct'])}`** | `{mc['median_turnaround_minutes'] if mc['median_turnaround_minutes'] is not None else '—'} min` |",
+        f"| Author Tier `T1` (Light) | `{bt['T1']['reviews']}` | `{bt['T1']['reviews'] - bt['T1']['corrected']}` | `{bt['T1']['corrected']}` | `{_fmt_pct(bt['T1']['intercept_rate_pct'])}` | — |",
+        f"| Author Tier `T2` (Standard) | `{bt['T2']['reviews']}` | `{bt['T2']['reviews'] - bt['T2']['corrected']}` | `{bt['T2']['corrected']}` | `{_fmt_pct(bt['T2']['intercept_rate_pct'])}` | — |",
+        f"| Author Tier `T3` (Thorough) | `{bt['T3']['reviews']}` | `{bt['T3']['reviews'] - bt['T3']['corrected']}` | `{bt['T3']['corrected']}` | `{_fmt_pct(bt['T3']['intercept_rate_pct'])}` | — |",
+        f"| Cross-Family (`Claude ↔ Gemini`) | `{bp['cross_family']['reviews']}` | `{bp['cross_family']['reviews'] - bp['cross_family']['corrected']}` | `{bp['cross_family']['corrected']}` | `{_fmt_pct(bp['cross_family']['intercept_rate_pct'])}` | — |",
+        f"| Same-Family | `{bp['same_family']['reviews']}` | `{bp['same_family']['reviews'] - bp['same_family']['corrected']}` | `{bp['same_family']['corrected']}` | `{_fmt_pct(bp['same_family']['intercept_rate_pct'])}` | — |",
+        "",
+        f"*(Admin skipped reviews: `{mc['skipped_reviews']}`; 90-min unreviewed timeouts: `{mc['unreviewed_timeouts']}`.)*",
+        "",
+        "### 2. Outbox → Human Action Conversion (`M-NNN` → `D-NNN`)",
+        "",
+        "| Delivered (`M-NNN`) | Acted | Explicit Pass | Explicit Defer | Dismissed | Awaiting (`< 7d`) | Unacted (`>= 7d`) | **ACR (All Delivered)** | **ACR (Resolved / >=7d, target >=60%)** |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        f"| `{ac['delivered_actionable_count']}` | `{ac['acted_count']}` | `{ac['passed_decision_count']}` | `{ac['deferred_decision_count']}` | `{ac['dismissed_count']}` | `{ac['awaiting_within_7d_count']}` | `{ac['expired_unacted_7d_count']}` | **`{_fmt_pct(ac['acr_all_delivered_pct'])}`** | **`{_fmt_pct(ac['acr_resolved_or_7d_pct'])}`** |",
+        "",
+        "### 3. Zero-Idle-Token OS Gatekeeper & Legacy Cron Retirement",
+        "",
+        "| Idle Ticks Skipped (`0` tokens) | Active Worker Invocations | Idle Skip Rate | Est. Uncached Prefill Saved (`@160k/tick`) | Legacy In-Session Crons Retired |",
+        "| ---: | ---: | ---: | ---: | ---: |",
+        f"| `{gk['idle_ticks_skipped']}` | `{gk['active_ticks_invoked']}` | `{_fmt_pct(gk['idle_skip_rate_pct'])}` | **`{gk['estimated_uncached_tokens_saved']:,} tokens`** | `{gk['retired_in_session_count']}` |",
+    ]
+    return "\n".join(lines)
+
+
+def save_metrics_state(
+    wiki_dir: Path,
+    state: dict[str, Any],
+    *,
+    state_dir: Path | None = None,
+) -> dict[str, Any]:
+    mpath = wiki_dir / METRICS_LEDGER_FILE
+    gk = load_gatekeeper_metrics(state_dir)
+    window_days = int(state.get("window_days") or 30)
+    report = compute_metrics_report(state, gk, window_days=window_days)
+    summary_md = render_metrics_summary_markdown(report)
+    fenced_json = "```json\n" + json.dumps(state, indent=2, sort_keys=False) + "\n```"
+
+    if mpath.exists():
+        text = mpath.read_text(encoding="utf-8")
+        text = replace_between_markers(
+            text, METRICS_SUMMARY_START, METRICS_SUMMARY_END, summary_md
+        )
+        text = replace_between_markers(
+            text, METRICS_JSON_START, METRICS_JSON_END, fenced_json
+        )
+    else:
+        b_file = board_filename(wiki_dir)
+        in_file = human_inbox_filename(wiki_dir)
+        out_file = human_outbox_filename(wiki_dir)
+        related: list[str] = []
+        for candidate in (CONVENTIONS_FILE, ROSTER_FILE, b_file, in_file, out_file):
+            if (wiki_dir / candidate).exists():
+                related.append(f"- [{candidate}]({candidate})")
+        rel_block = "\n".join(related) if related else "- *(Standalone metrics ledger)*"
+        text = (
+            "# Herd Quality, Maker–Checker Verification, and 30-Day Usefulness Metrics Ledger\n\n"
+            "This ledger tracks longitudinal usefulness and verification quality across the Herd:\n"
+            "1. **Maker–Checker Defect Intercept Rate** (`complete-review --verdict verified|corrected`, stratified by author capability tier and cross-family pairing).\n"
+            "2. **Action Conversion Rate (`ACR`)** (`M-NNN` outbox deliverables linked to `D-NNN` human actions/decisions within 7 days).\n"
+            "3. **Zero-Idle-Token Gatekeeper Savings** (`systemd --user` Python `quick-check` ticks skipped vs. active worker invocations).\n\n"
+            "Related pages:\n"
+            f"{rel_block}\n\n"
+            "## Live Rolling Summary\n\n"
+            f"{METRICS_SUMMARY_START}\n{summary_md}\n{METRICS_SUMMARY_END}\n\n"
+            "## Machine-Readable Telemetry State\n\n"
+            f"{METRICS_JSON_START}\n{fenced_json}\n{METRICS_JSON_END}\n"
+        )
+    atomic_write(mpath, text)
+    return report
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -744,6 +1181,35 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
 
     agent = args.agent.lower().strip() if args.agent else None
     now = utc_now()
+
+    if should_retire_in_session_cron(args, wiki_dir, agent):
+        update_gatekeeper_metrics(
+            _state_dir_from_args(args),
+            retired_in_session_agent=agent,
+        )
+        retire_msg = (
+            "IN-SESSION CRON RETIRED (KV-cache token savings): Hourly worker polling now runs "
+            "externally via zero-idle-token systemd gatekeepers (herd_agy_worker.py / herd_claude_worker.py). "
+            "Immediately call `manage_task` with `Action: \"list\"`, then call `manage_task` with "
+            "`Action: \"kill\"` on EVERY active `schedule` / cron background task in this conversation. "
+            "Do NOT call `heartbeat`, do NOT edit any wiki files, do NOT schedule a new cron, and end your turn immediately."
+        )
+        print(
+            json.dumps(
+                {
+                    "agent": agent,
+                    "utc": iso_utc(now),
+                    "action_needed": True,
+                    "retire_in_session_cron": True,
+                    "reasons": ["retire_in_session_cron"],
+                    "URGENT_INSTRUCTION": retire_msg,
+                    "next_step": "Call manage_task(Action='list') then manage_task(Action='kill', TaskId=...) on every schedule/cron task in this conversation, touch zero wiki files, and end your turn immediately.",
+                },
+                indent=2,
+            )
+        )
+        return 0
+
     cards = parse_agent_cards(wiki_dir)
     agent_hb: dt.datetime | None = None
     if agent and agent in cards:
@@ -924,9 +1390,11 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
             human_inbox_updated = True
 
     updated_wiki_files: list[str] = []
+    updated_kb_files: list[str] = []
     ignored_exact = {
         ROSTER_FILE,
         SB_LEDGER_FILE,
+        METRICS_LEDGER_FILE,
         b_file,
         CONVENTIONS_FILE,
         in_file,
@@ -944,7 +1412,10 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
         mtime = dt.datetime.fromtimestamp(entry.stat().st_mtime, dt.timezone.utc)
         # Allow 2s tolerance against heartbeat second-rounding
         if agent_hb is None or (mtime - agent_hb).total_seconds() > 2:
-            updated_wiki_files.append(name)
+            if name.startswith("kb-") or name.startswith("kb--"):
+                updated_kb_files.append(name)
+            else:
+                updated_wiki_files.append(name)
 
     reasons: list[str] = []
     skill_md_path = Path(__file__).resolve().parent.parent / "SKILL.md"
@@ -989,7 +1460,7 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
     )
     if skill_updated:
         next_step = (
-            f"SKILL.md was updated since your last heartbeat (peer-review & model/effort declaration protocol). "
+            f"SKILL.md was updated since your last heartbeat. "
             f"Re-read {skill_md_path} first.{meta_hint} If no review or open tasks need work, call heartbeat --status idle once to record the reload and return to waiting."
         )
     elif review_tasks or own_in_review_tasks:
@@ -1025,6 +1496,7 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
                 "own_in_progress_tasks": own_in_progress_tasks,
                 "stale_in_progress_tasks": stale_in_progress_tasks,
                 "updated_wiki_files": updated_wiki_files,
+                "updated_kb_files": updated_kb_files,
                 "next_step": next_step,
             },
             indent=2,
@@ -1109,6 +1581,51 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
                 }
             )
         )
+    return 0
+
+
+def cmd_retire_agent(args: argparse.Namespace) -> int:
+    wiki_dir: Path = args.wiki_dir
+    agents = [a.lower().strip() for a in args.agents if a.strip()]
+    retired_list: list[str] = []
+    now = iso_utc()
+
+    with FileLock(args.lock_file):
+        cards = parse_agent_cards(wiki_dir)
+        for agent in agents:
+            if agent == "runai" or agent not in cards:
+                continue
+            card_path = wiki_dir / cards[agent]["filename"]
+            body = card_path.read_text(encoding="utf-8")
+            body = re.sub(
+                r"^- \*\*Status\*\*:\s*.+$",
+                "- **Status**: `retired`",
+                body,
+                count=1,
+                flags=re.MULTILINE,
+            )
+            if re.search(r"^- \*\*Wakeup Cron\*\*:\s*.+$", body, re.MULTILINE):
+                body = re.sub(
+                    r"^- \*\*Wakeup Cron\*\*:\s*.+$",
+                    "- **Wakeup Cron**: `retired (replaced by zero-idle-token systemd fleet)`",
+                    body,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+            reason = args.reason or "Retired in-session cron worker to eliminate cold-KV-cache idle polling."
+            body = re.sub(
+                r"^- \*\*Current Focus\*\*:\s*.+$",
+                f"- **Current Focus**: {reason}",
+                body,
+                count=1,
+                flags=re.MULTILINE,
+            )
+            atomic_write(card_path, body)
+            retired_list.append(agent)
+        if retired_list:
+            sync_roster_table(wiki_dir)
+
+    print(json.dumps({"ok": True, "retired": retired_list, "utc": now}, indent=2))
     return 0
 
 
@@ -1347,6 +1864,33 @@ def save_sb_state(ledger_path: Path, state: dict[str, object], history_entry: st
 
 def cmd_sb_check(args: argparse.Namespace) -> int:
     wiki_dir: Path = args.wiki_dir
+    agent_arg = args.agent.lower().strip() if args.agent else None
+    if should_retire_in_session_cron(args, wiki_dir, agent_arg):
+        update_gatekeeper_metrics(
+            _state_dir_from_args(args),
+            retired_in_session_agent=agent_arg,
+        )
+        retire_msg = (
+            "IN-SESSION CRON RETIRED (KV-cache token savings): Periodic worker schedules now run "
+            "externally via zero-idle-token systemd gatekeepers. Immediately call `manage_task` "
+            "with `Action: \"list\"`, then call `manage_task` with `Action: \"kill\"` on EVERY "
+            "active `schedule` / cron background task in this conversation, do NOT schedule a new cron, "
+            "and end your turn immediately."
+        )
+        print(
+            json.dumps(
+                {
+                    "due": False,
+                    "claimed": False,
+                    "retire_in_session_cron": True,
+                    "URGENT_INSTRUCTION": retire_msg,
+                    "reason": retire_msg,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
     ledger_path = wiki_dir / SB_LEDGER_FILE
     if not ledger_path.exists():
         print(f"ERROR: Missing ledger file: {ledger_path}", file=sys.stderr)
@@ -1895,6 +2439,34 @@ def cmd_complete_task(args: argparse.Namespace) -> int:
         )
         text = save_board_review_state(text, rev_state)
         atomic_write(board_path, text)
+
+        mstate = load_metrics_state(wiki_dir)
+        if mstate is not None:
+            revs = list(mstate.get("reviews") or [])
+            revs = [r for r in revs if r.get("task_id") != target_id]
+            revs.append(
+                {
+                    "task_id": target_id,
+                    "utc": now_str,
+                    "priority": match_row["priority"],
+                    "output_file": out_name or None,
+                    "author": agent,
+                    "author_spec": author_spec,
+                    "author_tier": author_tier,
+                    "author_family": author_family,
+                    "reviewer": None,
+                    "reviewer_spec": None,
+                    "reviewer_tier": None,
+                    "reviewer_family": None,
+                    "cross_family": False,
+                    "verdict": "skipped",
+                    "turnaround_minutes": None,
+                    "notes": (args.notes or "").strip() or None,
+                }
+            )
+            mstate["reviews"] = revs
+            save_metrics_state(wiki_dir, mstate, state_dir=_state_dir_from_args(args))
+
         print(
             json.dumps(
                 {
@@ -2221,6 +2793,73 @@ def cmd_complete_review(args: argparse.Namespace) -> int:
             )
             atomic_write(outbox_path, updated_out)
 
+        mstate = load_metrics_state(wiki_dir)
+        if mstate is not None:
+            author_family = str(
+                rmeta.get("author_family")
+                or (cards[author]["family"] if author in cards else "unspecified")
+            )
+            rev_family = str(rev_card.get("family") or "unspecified")
+            cross_fam = bool(
+                author_family != "unspecified"
+                and rev_family != "unspecified"
+                and author_family != rev_family
+            )
+            sub_dt = parse_iso_utc(str(rmeta.get("submitted_utc") or ""))
+            now_dt = parse_iso_utc(now_str)
+            turnaround_min = (
+                round((now_dt - sub_dt).total_seconds() / 60.0, 1)
+                if (sub_dt is not None and now_dt is not None)
+                else None
+            )
+            revs = [
+                r
+                for r in list(mstate.get("reviews") or [])
+                if r.get("task_id") != target_id
+            ]
+            revs.append(
+                {
+                    "task_id": target_id,
+                    "utc": now_str,
+                    "priority": rmeta.get("priority") or match_row["priority"],
+                    "output_file": out_name or None,
+                    "author": author,
+                    "author_spec": author_spec,
+                    "author_tier": author_tier,
+                    "author_family": author_family,
+                    "reviewer": reviewer,
+                    "reviewer_spec": rev_spec,
+                    "reviewer_tier": rev_tier,
+                    "reviewer_family": rev_family,
+                    "cross_family": cross_fam,
+                    "verdict": verdict,
+                    "turnaround_minutes": turnaround_min,
+                    "notes": rev_notes,
+                }
+            )
+            mstate["reviews"] = revs
+            if queued_mid:
+                oitems = dict(mstate.get("outbox_items") or {})
+                cur_item = dict(oitems.get(queued_mid) or {})
+                cur_item.update(
+                    {
+                        "id": queued_mid,
+                        "task_id": target_id,
+                        "created_utc": cur_item.get("created_utc") or now_str,
+                        "agent": author,
+                        "reviewer": reviewer,
+                        "review_verdict": verdict,
+                        "kind": "deliverable",
+                        "due": due_val if due_val != "—" else None,
+                        "output_file": out_name or None,
+                        "summary": human_msg,
+                        "outcome": cur_item.get("outcome") or "awaiting",
+                    }
+                )
+                oitems[queued_mid] = cur_item
+                mstate["outbox_items"] = oitems
+            save_metrics_state(wiki_dir, mstate, state_dir=_state_dir_from_args(args))
+
         print(
             json.dumps(
                 {
@@ -2372,6 +3011,45 @@ def compute_output_hashes(wiki_dir: Path) -> dict[str, dict[str, object]]:
     return out
 
 
+def _apply_outcome_to_outbox_items(
+    mstate: dict[str, Any],
+    message_ids: list[str],
+    *,
+    outcome: str,
+    outcome_utc: str,
+    directive_id: str | None = None,
+    notes: str | None = None,
+) -> list[str]:
+    oitems = dict(mstate.get("outbox_items") or {})
+    updated_ids: list[str] = []
+    out_dt = parse_iso_utc(outcome_utc)
+    for raw_mid in message_ids:
+        mid = raw_mid.upper().strip()
+        if not re.match(r"^M-\d{3,}$", mid):
+            continue
+        item = dict(oitems.get(mid) or {"id": mid, "kind": "deliverable"})
+        ref_ts = parse_iso_utc(
+            str(item.get("delivered_utc") or item.get("created_utc") or "")
+        )
+        conv_hours = (
+            round((out_dt - ref_ts).total_seconds() / 3600.0, 2)
+            if (out_dt is not None and ref_ts is not None)
+            else None
+        )
+        item["outcome"] = outcome
+        item["outcome_utc"] = outcome_utc
+        if directive_id:
+            item["directive_id"] = directive_id
+        if conv_hours is not None:
+            item["conversion_hours"] = conv_hours
+        if notes:
+            item["outcome_notes"] = notes
+        oitems[mid] = item
+        updated_ids.append(mid)
+    mstate["outbox_items"] = oitems
+    return updated_ids
+
+
 def cmd_post_directive(args: argparse.Namespace) -> int:
     wiki_dir: Path = args.wiki_dir
     inbox_path = wiki_dir / human_inbox_filename(wiki_dir)
@@ -2386,9 +3064,21 @@ def cmd_post_directive(args: argparse.Namespace) -> int:
         now_str = iso_utc()
         channel = args.channel.lower().strip()
         recorded_by = args.agent.lower().strip()
+        resolves_raw = getattr(args, "resolves", None) or ""
+        resolved_mids = [
+            tok.strip().upper()
+            for tok in re.split(r"[,\s]+", resolves_raw)
+            if tok.strip()
+        ]
+        if not resolved_mids and getattr(args, "outcome", None):
+            resolved_mids = sorted(
+                {m.group(0).upper() for m in re.finditer(r"\bM-\d{3,}\b", args.summary, re.IGNORECASE)}
+            )
+        outcome_val = (getattr(args, "outcome", None) or ("acted" if resolved_mids else "")).strip().lower()
+        res_tag = f" *(resolves {', '.join(f'`{m}`' for m in resolved_mids)}: `{outcome_val}`)*" if resolved_mids else ""
         entry = (
             f"- **`{did}`** ({now_str}, via `{channel}`, recorded by `@{recorded_by}` "
-            f"`[chat {now_str[:10]}]`): {args.summary.strip()}"
+            f"`[chat {now_str[:10]}]`): {args.summary.strip()}{res_tag}"
         )
 
         existing = extract_between_markers(
@@ -2404,7 +3094,43 @@ def cmd_post_directive(args: argparse.Namespace) -> int:
             text, "<!-- HUMAN_INBOX_START -->", "<!-- HUMAN_INBOX_END -->", "\n".join(lines)
         )
         atomic_write(inbox_path, updated)
-        print(json.dumps({"directive_id": did, "utc": now_str, "channel": channel}))
+
+        linked_mids: list[str] = []
+        mstate = load_metrics_state(wiki_dir)
+        if mstate is not None:
+            dmap = dict(mstate.get("directives") or {})
+            dmap[did] = {
+                "id": did,
+                "utc": now_str,
+                "channel": channel,
+                "recorded_by": recorded_by,
+                "resolves": resolved_mids,
+                "outcome": outcome_val or None,
+                "summary": args.summary.strip(),
+            }
+            mstate["directives"] = dmap
+            if resolved_mids and outcome_val:
+                linked_mids = _apply_outcome_to_outbox_items(
+                    mstate,
+                    resolved_mids,
+                    outcome=outcome_val,
+                    outcome_utc=now_str,
+                    directive_id=did,
+                    notes=args.summary.strip()[:200],
+                )
+            save_metrics_state(wiki_dir, mstate, state_dir=_state_dir_from_args(args))
+
+        print(
+            json.dumps(
+                {
+                    "directive_id": did,
+                    "utc": now_str,
+                    "channel": channel,
+                    "resolved_outbox_ids": linked_mids,
+                    "outcome": outcome_val or None,
+                }
+            )
+        )
     return 0
 
 
@@ -2516,6 +3242,27 @@ def cmd_notify_human(args: argparse.Namespace) -> int:
             format_outbox_pending(rows),
         )
         atomic_write(outbox_path, updated)
+
+        mstate = load_metrics_state(wiki_dir)
+        if mstate is not None:
+            oitems = dict(mstate.get("outbox_items") or {})
+            cur_item = dict(oitems.get(mid) or {})
+            cur_item.update(
+                {
+                    "id": mid,
+                    "created_utc": now_str,
+                    "agent": args.agent.lower().strip(),
+                    "kind": args.kind.lower().strip(),
+                    "due": args.due.strip() if args.due else None,
+                    "output_file": fname or None,
+                    "summary": args.message.strip(),
+                    "outcome": cur_item.get("outcome") or "awaiting",
+                }
+            )
+            oitems[mid] = cur_item
+            mstate["outbox_items"] = oitems
+            save_metrics_state(wiki_dir, mstate, state_dir=_state_dir_from_args(args))
+
         print(
             json.dumps(
                 {
@@ -2627,7 +3374,7 @@ def cmd_spokesperson_mark_sent(args: argparse.Namespace) -> int:
         prev_seen: dict[str, dict[str, object]] = dict(state.get("seen_outputs") or {})  # type: ignore[arg-type]
         now_str = iso_utc()
 
-        held_files, _, _ = get_review_hold_status(
+        held_files, _, unreviewed_timeouts = get_review_hold_status(
             wiki_dir, timeout_minutes=args.review_timeout_minutes
         )
         delivered_pending = [
@@ -2699,6 +3446,46 @@ def cmd_spokesperson_mark_sent(args: argparse.Namespace) -> int:
             text, "<!-- OUTBOX_SENT_START -->", "<!-- OUTBOX_SENT_END -->", "\n".join(sent_lines)
         )
         atomic_write(outbox_path, text)
+
+        mstate = load_metrics_state(wiki_dir)
+        if mstate is not None and (delivered_pending or unreviewed_timeouts):
+            oitems = dict(mstate.get("outbox_items") or {})
+            for r in delivered_pending:
+                mid = r["id"].upper()
+                cur_item = dict(oitems.get(mid) or {"id": mid})
+                deliv_m = re.search(r"\(([^)]+\.md)\)", r.get("deliverable", ""))
+                cur_item.setdefault("created_utc", r.get("created") or now_str)
+                cur_item.setdefault("agent", r.get("agent"))
+                cur_item.setdefault("kind", r.get("kind") or "deliverable")
+                cur_item.setdefault("output_file", deliv_m.group(1) if deliv_m else None)
+                cur_item.setdefault("summary", r.get("summary"))
+                cur_item["delivered_utc"] = now_str
+                cur_item["delivered_by"] = args.agent.lower().strip()
+                cur_item.setdefault("outcome", "awaiting")
+                oitems[mid] = cur_item
+            mstate["outbox_items"] = oitems
+
+            if unreviewed_timeouts:
+                revs = list(mstate.get("reviews") or [])
+                seen_tids = {str(rv.get("task_id")) for rv in revs}
+                for to_item in unreviewed_timeouts:
+                    tid = str(to_item.get("task_id") or "")
+                    if tid and tid not in seen_tids:
+                        revs.append(
+                            {
+                                "task_id": tid,
+                                "utc": now_str,
+                                "output_file": to_item.get("output_file"),
+                                "author": to_item.get("author"),
+                                "author_spec": to_item.get("author_spec"),
+                                "verdict": "timeout_unreviewed",
+                                "turnaround_minutes": to_item.get("age_minutes"),
+                            }
+                        )
+                        seen_tids.add(tid)
+                mstate["reviews"] = revs
+            save_metrics_state(wiki_dir, mstate, state_dir=_state_dir_from_args(args))
+
         print(
             json.dumps(
                 {
@@ -2709,6 +3496,211 @@ def cmd_spokesperson_mark_sent(args: argparse.Namespace) -> int:
                 }
             )
         )
+    return 0
+
+
+def cmd_record_gatekeeper_tick(args: argparse.Namespace) -> int:
+    data = update_gatekeeper_metrics(
+        _state_dir_from_args(args),
+        tick_agent=args.agent,
+        runtime=args.runtime,
+        model=args.model,
+        effort=args.effort,
+        invoked=bool(args.invoked),
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "agent": args.agent.lower().strip(),
+                "invoked": bool(args.invoked),
+                "idle_ticks_skipped": data.get("idle_ticks_skipped", 0),
+                "active_ticks_invoked": data.get("active_ticks_invoked", 0),
+            }
+        )
+    )
+    return 0
+
+
+def _backfill_metrics_from_wiki(wiki_dir: Path, mstate: dict[str, Any]) -> None:
+    oitems: dict[str, dict[str, Any]] = dict(mstate.get("outbox_items") or {})
+    dmap: dict[str, dict[str, Any]] = dict(mstate.get("directives") or {})
+
+    outbox_path = wiki_dir / human_outbox_filename(wiki_dir)
+    if outbox_path.exists():
+        otxt = outbox_path.read_text(encoding="utf-8")
+        for r in parse_outbox_pending(otxt):
+            mid = r["id"].upper()
+            deliv_m = re.search(r"\(([^)]+\.md)\)", r.get("deliverable", ""))
+            oitems.setdefault(
+                mid,
+                {
+                    "id": mid,
+                    "created_utc": r.get("created"),
+                    "agent": r.get("agent"),
+                    "kind": r.get("kind") or "deliverable",
+                    "due": r.get("due") if r.get("due") != "—" else None,
+                    "output_file": deliv_m.group(1) if deliv_m else None,
+                    "summary": r.get("summary"),
+                    "outcome": "awaiting",
+                },
+            )
+        if "<!-- OUTBOX_SENT_START -->" in otxt:
+            sent_block = extract_between_markers(
+                otxt, "<!-- OUTBOX_SENT_START -->", "<!-- OUTBOX_SENT_END -->"
+            )
+            sent_re = re.compile(
+                r"^- \*\*`(M-\d{3,})`\*\* \(delivered ([^ )]+) by `@([^`]+)`, from `@([^`]+)`, `([^`]+)`\):\s*(.+)$"
+            )
+            for ln in sent_block.splitlines():
+                m = sent_re.match(ln.strip())
+                if not m:
+                    continue
+                mid, deliv_utc, deliv_by, from_ag, kind, rest = m.groups()
+                out_m = re.search(r"\(\[[^\]]+\]\(([^)]+\.md)\)\)\s*$", rest)
+                clean_sum = re.sub(r"\s*\(\[[^\]]+\]\([^)]+\.md\)\)\s*$", "", rest).strip()
+                cur = dict(oitems.get(mid) or {"id": mid})
+                cur.setdefault("created_utc", deliv_utc)
+                cur.setdefault("agent", from_ag)
+                cur.setdefault("kind", kind)
+                cur.setdefault("output_file", out_m.group(1) if out_m else None)
+                cur.setdefault("summary", clean_sum)
+                cur.setdefault("delivered_utc", deliv_utc)
+                cur.setdefault("delivered_by", deliv_by)
+                cur.setdefault("outcome", "awaiting")
+                oitems[mid] = cur
+
+    inbox_path = wiki_dir / human_inbox_filename(wiki_dir)
+    if inbox_path.exists():
+        itxt = inbox_path.read_text(encoding="utf-8")
+        if "<!-- HUMAN_INBOX_START -->" in itxt:
+            in_block = extract_between_markers(
+                itxt, "<!-- HUMAN_INBOX_START -->", "<!-- HUMAN_INBOX_END -->"
+            )
+            dir_re = re.compile(
+                r"^- \*\*`(D-\d{3,})`\*\* \(([^,]+), via `([^`]+)`, recorded by `@([^`]+)`[^)]*\):\s*(.+)$"
+            )
+            for ln in in_block.splitlines():
+                m = dir_re.match(ln.strip())
+                if not m:
+                    continue
+                did, dutc, chan, rec_by, dsum = m.groups()
+                dmap.setdefault(
+                    did,
+                    {
+                        "id": did,
+                        "utc": dutc.strip(),
+                        "channel": chan.strip(),
+                        "recorded_by": rec_by.strip(),
+                        "resolves": [],
+                        "outcome": None,
+                        "summary": dsum.strip(),
+                    },
+                )
+
+    board_path = wiki_dir / board_filename(wiki_dir)
+    if board_path.exists() and not mstate.get("pre_maker_checker_baseline"):
+        btxt = board_path.read_text(encoding="utf-8")
+        done_ids = sorted({m.group(0) for m in re.finditer(r"T-\d{3,}", btxt)})
+        mstate["pre_maker_checker_baseline"] = {
+            "historical_tasks_completed": len(done_ids),
+            "note": "Completed prior to structured Maker-Checker instrumentation; live peer-review counters start cleanly from deployment.",
+        }
+
+    mstate["outbox_items"] = oitems
+    mstate["directives"] = dmap
+
+
+def cmd_metrics_init(args: argparse.Namespace) -> int:
+    wiki_dir: Path = args.wiki_dir
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    with FileLock(args.lock_file):
+        mstate = load_metrics_state(wiki_dir) or default_metrics_state()
+        mstate["window_days"] = int(args.window_days)
+        if args.backfill:
+            _backfill_metrics_from_wiki(wiki_dir, mstate)
+        report = save_metrics_state(
+            wiki_dir, mstate, state_dir=_state_dir_from_args(args)
+        )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "ledger_file": METRICS_LEDGER_FILE,
+                "backfilled": bool(args.backfill),
+                "report": report,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_record_outcome(args: argparse.Namespace) -> int:
+    wiki_dir: Path = args.wiki_dir
+    mids = [
+        tok.strip().upper()
+        for tok in re.split(r"[,\s]+", args.message_id)
+        if tok.strip()
+    ]
+    if not mids:
+        print("ERROR: Provide at least one M-NNN message ID.", file=sys.stderr)
+        return 2
+    now_str = args.outcome_utc.strip() if args.outcome_utc else iso_utc()
+
+    with FileLock(args.lock_file):
+        mstate = load_metrics_state(wiki_dir) or default_metrics_state()
+        updated_ids = _apply_outcome_to_outbox_items(
+            mstate,
+            mids,
+            outcome=args.outcome.lower().strip(),
+            outcome_utc=now_str,
+            directive_id=args.directive_id.upper().strip() if args.directive_id else None,
+            notes=args.notes.strip() if args.notes else None,
+        )
+        if args.directive_id:
+            did = args.directive_id.upper().strip()
+            dmap = dict(mstate.get("directives") or {})
+            if did in dmap:
+                existing_res = list(dmap[did].get("resolves") or [])
+                for mid in updated_ids:
+                    if mid not in existing_res:
+                        existing_res.append(mid)
+                dmap[did]["resolves"] = existing_res
+                dmap[did]["outcome"] = args.outcome.lower().strip()
+                mstate["directives"] = dmap
+        report = save_metrics_state(
+            wiki_dir, mstate, state_dir=_state_dir_from_args(args)
+        )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "updated_message_ids": updated_ids,
+                "outcome": args.outcome.lower().strip(),
+                "action_conversion": report["action_conversion"],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_metrics_report(args: argparse.Namespace) -> int:
+    wiki_dir: Path = args.wiki_dir
+    sdir = _state_dir_from_args(args)
+    if args.sync_ledger:
+        with FileLock(args.lock_file):
+            mstate = load_metrics_state(wiki_dir) or default_metrics_state()
+            if args.window_days:
+                mstate["window_days"] = int(args.window_days)
+            report = save_metrics_state(wiki_dir, mstate, state_dir=sdir)
+    else:
+        mstate = load_metrics_state(wiki_dir) or default_metrics_state()
+        gk = load_gatekeeper_metrics(sdir)
+        win = int(args.window_days or mstate.get("window_days") or 30)
+        report = compute_metrics_report(mstate, gk, window_days=win)
+    print(json.dumps(report, indent=2))
     return 0
 
 
@@ -2728,6 +3720,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_LOCK_PATH,
         help=f"Path to flock file outside wiki (default: {DEFAULT_LOCK_PATH})",
     )
+    p.add_argument(
+        "--state-dir",
+        type=Path,
+        default=DEFAULT_STATE_DIR,
+        help=f"Path to non-wiki daemon/gatekeeper state directory (default: {DEFAULT_STATE_DIR})",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("index", help="List all wiki markdown files grouped by category.")
@@ -2738,7 +3736,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reg.add_argument("--name", help="Optional preferred lowercase single-word name.")
     reg.add_argument("--focus", help="Short summary of initial focus.")
-    reg.add_argument("--runtime", help="Agent runtime (e.g. antigravity, claude-code).")
+    reg.add_argument("--runtime", help="Agent runtime (e.g. antigravity-cli, antigravity, claude-code).")
     reg.add_argument("--model", help="Declared model (e.g. gemini-4-carbon, gemini-4-argon, gemini-3.8-flash, sonnet, opus, gemini-unspecified).")
     reg.add_argument("--effort", help="Declared effort level (e.g. 1.00, 0.50, low, medium, high, xhigh, max).")
 
@@ -2747,7 +3745,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Update declared runtime, model, effort, and computed capability tier on an agent card.",
     )
     sam.add_argument("--agent", required=True, help="Registered agent name.")
-    sam.add_argument("--runtime", help="Agent runtime (e.g. antigravity, claude-code).")
+    sam.add_argument("--runtime", help="Agent runtime (e.g. antigravity-cli, antigravity, claude-code).")
     sam.add_argument("--model", help="Declared model name.")
     sam.add_argument("--effort", help="Declared effort level.")
     sam.add_argument("--touch-heartbeat", action="store_true", help="Also advance Last Heartbeat (UTC).")
@@ -2767,6 +3765,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     qc.add_argument("--agent", help="Registered agent name.")
     qc.add_argument("--stale-minutes", type=int, default=120)
+    qc.add_argument(
+        "--external-gatekeeper",
+        action="store_true",
+        help="Indicate this quick-check is called from a zero-idle-token OS gatekeeper.",
+    )
+    qc.add_argument(
+        "--allow-in-session-cron",
+        action="store_true",
+        help="Bypass the legacy in-session cron retirement guard.",
+    )
+    qc.add_argument(
+        "--enforce-external-gatekeeper",
+        action="store_true",
+        help="Enforce in-session cron retirement even on non-default wiki paths (for testing).",
+    )
 
     hb = sub.add_parser(
         "heartbeat", help="Update agent status, heartbeat, and summary-named presence file."
@@ -2775,12 +3788,19 @@ def build_parser() -> argparse.ArgumentParser:
     hb.add_argument(
         "--status",
         default="active",
-        choices=["active", "coordinating", "working", "reviewing", "idle"],
+        choices=["active", "coordinating", "working", "reviewing", "idle", "retired"],
     )
     hb.add_argument("--focus", help="Updated summary of current focus (renames presence file).")
     hb.add_argument("--runtime", help="Optional runtime update.")
     hb.add_argument("--model", help="Optional model update.")
     hb.add_argument("--effort", help="Optional effort update.")
+
+    ret_cmd = sub.add_parser(
+        "retire-agent",
+        help="Mark one or more legacy worker agents as retired on their cards and the roster.",
+    )
+    ret_cmd.add_argument("agents", nargs="+", help="Agent name(s) to mark retired.")
+    ret_cmd.add_argument("--reason", help="Optional retirement note for Current Focus.")
 
     ren = sub.add_parser(
         "rename", help="Rename a wiki file when its summary changes and rewrite incoming links."
@@ -2806,6 +3826,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_GEMINI_LAG_HOURS,
         help=f"Lag threshold in hours for Gemini-synced sources (default: {DEFAULT_GEMINI_LAG_HOURS:g}).",
+    )
+    sbc.add_argument(
+        "--external-gatekeeper",
+        action="store_true",
+        help="Indicate this sb-check is called from a zero-idle-token OS gatekeeper.",
+    )
+    sbc.add_argument(
+        "--allow-in-session-cron",
+        action="store_true",
+        help="Bypass the legacy in-session cron retirement guard.",
+    )
+    sbc.add_argument(
+        "--enforce-external-gatekeeper",
+        action="store_true",
+        help="Enforce in-session cron retirement even on non-default wiki paths (for testing).",
     )
 
     sbw = sub.add_parser(
@@ -2889,6 +3924,15 @@ def build_parser() -> argparse.ArgumentParser:
     pd_cmd.add_argument("--agent", default="runai", help="Spokesperson agent recording this.")
     pd_cmd.add_argument("--channel", default="antigravity", help="Source channel (e.g. antigravity, signal).")
     pd_cmd.add_argument("--summary", required=True, help="Directive or answer from the user.")
+    pd_cmd.add_argument(
+        "--resolves",
+        help="Optional comma-separated M-NNN outbox IDs resolved or acted upon by this directive.",
+    )
+    pd_cmd.add_argument(
+        "--outcome",
+        choices=["acted", "passed", "deferred", "dismissed"],
+        help="Optional outcome classification when linking to M-NNN deliverables (default: acted).",
+    )
 
     nh_cmd = sub.add_parser(
         "notify-human",
@@ -2942,6 +3986,60 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Minutes to hold NEEDS_REVIEW deliverables before marking seen (default: {DEFAULT_REVIEW_TIMEOUT_MINUTES}).",
     )
 
+    rgt_cmd = sub.add_parser(
+        "record-gatekeeper-tick",
+        help="Record an OS gatekeeper Python tick (0-token idle skip or active invocation) outside the wiki.",
+    )
+    rgt_cmd.add_argument("--agent", required=True)
+    rgt_cmd.add_argument("--runtime", default="antigravity-cli")
+    rgt_cmd.add_argument("--model")
+    rgt_cmd.add_argument("--effort")
+    rgt_cmd.add_argument(
+        "--invoked",
+        action="store_true",
+        help="Set when quick-check was true and the worker LLM was invoked.",
+    )
+
+    mi_cmd = sub.add_parser(
+        "metrics-init",
+        help="Initialize (and optionally backfill) the 30-day usefulness and Maker-Checker metrics ledger.",
+    )
+    mi_cmd.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Seed historical M-NNN and D-NNN entries from existing outbox/inbox pages.",
+    )
+    mi_cmd.add_argument("--window-days", type=int, default=30)
+
+    ro_cmd = sub.add_parser(
+        "record-outcome",
+        help="Record human action/decision outcome for one or more M-NNN outbox deliverables.",
+    )
+    ro_cmd.add_argument(
+        "--message-id",
+        required=True,
+        help="One or more comma-separated M-NNN IDs (e.g. M-010,M-011).",
+    )
+    ro_cmd.add_argument(
+        "--outcome",
+        required=True,
+        choices=["acted", "passed", "deferred", "dismissed", "awaiting"],
+    )
+    ro_cmd.add_argument("--directive-id", help="Optional linked D-NNN directive ID.")
+    ro_cmd.add_argument("--outcome-utc", help="Optional explicit ISO-8601 UTC timestamp.")
+    ro_cmd.add_argument("--notes", help="Short note describing the action or decision.")
+
+    mr_cmd = sub.add_parser(
+        "metrics-report",
+        help="Compute Maker-Checker defect intercept rate, M-NNN -> D-NNN ACR, and gatekeeper token savings.",
+    )
+    mr_cmd.add_argument("--window-days", type=int, default=30)
+    mr_cmd.add_argument(
+        "--sync-ledger",
+        action="store_true",
+        help="Also refresh the rendered Markdown summary tables in the metrics ledger file.",
+    )
+
     return p
 
 
@@ -2956,6 +4054,7 @@ def main() -> int:
         "random-cron": cmd_random_cron,
         "quick-check": cmd_quick_check,
         "heartbeat": cmd_heartbeat,
+        "retire-agent": cmd_retire_agent,
         "rename": cmd_rename,
         "sb-check": cmd_sb_check,
         "sb-watchdog": cmd_sb_watchdog,
@@ -2969,6 +4068,10 @@ def main() -> int:
         "notify-human": cmd_notify_human,
         "spokesperson-check": cmd_spokesperson_check,
         "spokesperson-mark-sent": cmd_spokesperson_mark_sent,
+        "record-gatekeeper-tick": cmd_record_gatekeeper_tick,
+        "metrics-init": cmd_metrics_init,
+        "record-outcome": cmd_record_outcome,
+        "metrics-report": cmd_metrics_report,
     }
     return dispatch[args.cmd](args)
 
