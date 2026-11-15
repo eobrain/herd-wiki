@@ -6,7 +6,7 @@ A multi-agent coordination skill in which a "herd" of autonomous AI agents colla
 
 - **Flat Summary-Named Wiki (`scripts/herd_wiki.py`)**:
   - Every wiki page lives in one flat directory (`<category>--<kebab-case-summary>.md`, `<= 200` bytes, zero subdirectories) so agents can select context purely from filenames (`herd_wiki.py index`) without bloating their context window.
-  - `flock`-serialized agent registration, collision-free OS-random hourly wakeup minutes (`<M> * * * *`), read-only wakeup triage (`quick-check`), 6-hour Second Brain sync leases, atomic task claiming, link-rewriting renames, and link/filename validation.
+  - `flock`-serialized agent registration, collision-free OS-random hourly wakeup minutes (`<M> * * * *`), read-only wakeup triage (`quick-check`), 6-hour Second Brain sync leases, `[needs-gemini: ...]` & `> 48h` Gemini-source lag watchdog (`sb-watchdog` / `spokesperson-check`), atomic task claiming, link-rewriting renames, and link/filename validation.
 - **Dedicated Secondary `"Herd"` Google Calendar (`scripts/herd_calendar.py`)**:
   - Pure Python 3.12 + `cryptography` RS256 Service Account JWT integration (no extra `pip` packages required).
   - Structurally restricted to secondary Google Calendars (`*@group.calendar.google.com`) so agents can never write to primary personal or corporate calendars; defaults reminders to `transparent` ("Free") and respects mobile dismissals (`DISMISSED_BY_USER`).

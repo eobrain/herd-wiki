@@ -813,6 +813,139 @@ def cmd_rename(args: argparse.Namespace) -> int:
     return 0
 
 
+DEFAULT_GEMINI_LAG_HOURS = 48.0
+GEMINI_SYNC_SOURCES = ("google keep", "google chat", "google tasks")
+
+
+def inspect_sb_watchdog(
+    sb_dir: Path,
+    lag_hours: float = DEFAULT_GEMINI_LAG_HOURS,
+    now: dt.datetime | None = None,
+) -> dict[str, object]:
+    """Inspect latest `SB 01 Now*.md` for `[needs-gemini: ...]` tags and >48h Gemini source lag."""
+    now_dt = now or utc_now()
+    if not sb_dir.exists():
+        return {
+            "sb_now_file": None,
+            "lag_threshold_hours": lag_hours,
+            "needs_gemini_items": [],
+            "stale_gemini_sources": [],
+            "alerts": [],
+        }
+
+    candidates = sorted(
+        sb_dir.glob("SB 01 Now*.md"), key=lambda p: (p.stat().st_mtime, p.name)
+    )
+    if not candidates:
+        return {
+            "sb_now_file": None,
+            "lag_threshold_hours": lag_hours,
+            "needs_gemini_items": [],
+            "stale_gemini_sources": [],
+            "alerts": [],
+        }
+
+    sb_now_path = candidates[-1]
+    raw_text = sb_now_path.read_text(encoding="utf-8")
+    cleaned = strip_fenced_blocks(raw_text)
+
+    # 1. Extract `[needs-gemini: ...]` items (supporting Google Docs `\[...\]` escaping)
+    needs_gemini_items: list[str] = []
+    seen_ng: set[str] = set()
+    for m in re.finditer(
+        r"\\?\[\s*needs-gemini\s*:\s*(.+?)\\?\]", cleaned, flags=re.IGNORECASE
+    ):
+        item = re.sub(r"\\([\[\]_#*+\-.!])", r"\1", m.group(1)).strip()
+        if not item or item in {"...", "…"} or item.startswith("<"):
+            continue
+        norm = item.lower()
+        if norm not in seen_ng:
+            seen_ng.add(norm)
+            needs_gemini_items.append(item)
+
+    # 2. Parse `Sync state` table for Gemini-fed sources (`Google Keep`, `Google Chat`, `Google Tasks`)
+    stale_sources: list[dict[str, object]] = []
+    sec_m = re.search(
+        r"^##\s+\*?Sync state\*?\s*$(.*?)(?=^##\s+|\Z)",
+        cleaned,
+        flags=re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
+    if sec_m:
+        for line in sec_m.group(1).splitlines():
+            s = line.strip()
+            if (
+                not s.startswith("|")
+                or set(s.replace("|", "").strip()) <= {"-", ":", " "}
+            ):
+                continue
+            cols = [c.strip() for c in s.strip("|").split("|")]
+            if len(cols) < 2:
+                continue
+            src_name = re.sub(r"[*`]", "", cols[0]).strip()
+            src_lower = src_name.lower()
+            if src_lower == "source" or not any(
+                src_lower.startswith( target ) for target in GEMINI_SYNC_SOURCES
+            ):
+                continue
+            last_col = re.sub(r"[*`]", "", cols[1]).strip()
+            date_m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", last_col)
+            if not date_m:
+                stale_sources.append(
+                    {
+                        "source": src_name,
+                        "last_synced": last_col or "never",
+                        "lag_hours": None,
+                    }
+                )
+                continue
+            d = dt.date.fromisoformat(date_m.group(1))
+            # Anchor YYYY-MM-DD at 12:00 UTC (~04:00-05:00 local after overnight sync window)
+            anchor = dt.datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=dt.timezone.utc)
+            lag_h = round((now_dt - anchor).total_seconds() / 3600.0, 1)
+            if lag_h > lag_hours:
+                stale_sources.append(
+                    {
+                        "source": src_name,
+                        "last_synced": date_m.group(1),
+                        "lag_hours": lag_h,
+                    }
+                )
+
+    alerts: list[dict[str, object]] = []
+    for item in needs_gemini_items:
+        alerts.append(
+            {
+                "key": f"needs-gemini:{slugify(item, 90)}",
+                "kind": "needs_gemini",
+                "summary": f"Second Brain flagged attachment/item for Gemini: [needs-gemini: {item}]",
+            }
+        )
+    for st in stale_sources:
+        lag_desc = (
+            f"{st['lag_hours']}h (> {lag_hours:g}h threshold)"
+            if st["lag_hours"] is not None
+            else "never synced"
+        )
+        alerts.append(
+            {
+                "key": f"stale:{str(st['source']).lower()}:{st['last_synced']}",
+                "kind": "gemini_source_lag",
+                "summary": (
+                    f"{st['source']} in SB 01 Now Sync state is at {st['last_synced']} "
+                    f"({lag_desc}) — run interactive Gemini Second Brain log when convenient."
+                ),
+            }
+        )
+
+    return {
+        "sb_now_file": sb_now_path.name,
+        "lag_threshold_hours": lag_hours,
+        "needs_gemini_items": needs_gemini_items,
+        "stale_gemini_sources": stale_sources,
+        "alerts": alerts,
+    }
+
+
 def compute_sb_hashes(sb_dir: Path) -> dict[str, dict[str, object]]:
     result: dict[str, dict[str, object]] = {}
     if not sb_dir.exists():
@@ -956,6 +1089,9 @@ def cmd_sb_check(args: argparse.Namespace) -> int:
             if last_dt
             else iso_utc(now)
         )
+        watchdog = inspect_sb_watchdog(
+            args.sb_cache_dir, lag_hours=args.gemini_lag_hours, now=now
+        )
         print(
             json.dumps(
                 {
@@ -970,10 +1106,19 @@ def cmd_sb_check(args: argparse.Namespace) -> int:
                     "modified_files": modified_files,
                     "unchanged_files": unchanged_files,
                     "removed_files": removed_files,
+                    "gemini_watchdog": watchdog,
                 },
                 indent=2,
             )
         )
+    return 0
+
+
+def cmd_sb_watchdog(args: argparse.Namespace) -> int:
+    watchdog = inspect_sb_watchdog(
+        args.sb_cache_dir, lag_hours=args.gemini_lag_hours
+    )
+    print(json.dumps(watchdog, indent=2))
     return 0
 
 
@@ -1483,7 +1628,17 @@ def cmd_spokesperson_check(args: argparse.Namespace) -> int:
         elif seen[fname].get("sha256_16") != meta["sha256_16"]:
             modified_outputs.append(fname)
 
-    anything = bool(pending or new_outputs or modified_outputs)
+    seen_gemini_alerts: set[str] = set(state.get("seen_gemini_alerts") or [])  # type: ignore[arg-type]
+    watchdog = inspect_sb_watchdog(
+        args.sb_cache_dir, lag_hours=args.gemini_lag_hours
+    )
+    unseen_gemini_alerts = [
+        a for a in watchdog["alerts"] if a["key"] not in seen_gemini_alerts  # type: ignore[index]
+    ]
+
+    anything = bool(
+        pending or new_outputs or modified_outputs or unseen_gemini_alerts
+    )
     print(
         json.dumps(
             {
@@ -1493,6 +1648,7 @@ def cmd_spokesperson_check(args: argparse.Namespace) -> int:
                 "unsent_items": pending,
                 "new_outputs": new_outputs,
                 "modified_outputs": modified_outputs,
+                "gemini_watchdog_alerts": unseen_gemini_alerts,
             },
             indent=2,
         )
@@ -1512,10 +1668,17 @@ def cmd_spokesperson_mark_sent(args: argparse.Namespace) -> int:
         pending = parse_outbox_pending(text)
         state = load_outbox_state(text)
         now_str = iso_utc()
+        watchdog = inspect_sb_watchdog(
+            args.sb_cache_dir, lag_hours=args.gemini_lag_hours
+        )
+        active_alert_keys = sorted(
+            str(a["key"]) for a in watchdog["alerts"]  # type: ignore[index]
+        )
 
         state["last_reported_utc"] = now_str
         state["spokesperson_agent"] = args.agent.lower().strip()
         state["seen_outputs"] = compute_output_hashes(wiki_dir)
+        state["seen_gemini_alerts"] = active_alert_keys
 
         fenced = "```json\n" + json.dumps(state, indent=2) + "\n```"
         text = replace_between_markers(
@@ -1639,6 +1802,24 @@ def build_parser() -> argparse.ArgumentParser:
     sbc.add_argument("--force", action="store_true", help="Force claim even if <6h elapsed.")
     sbc.add_argument("--no-remote-sync", action="store_true", help="Skip calling sync.sh.")
     sbc.add_argument("--sb-cache-dir", type=Path, default=DEFAULT_SB_CACHE_DIR)
+    sbc.add_argument(
+        "--gemini-lag-hours",
+        type=float,
+        default=DEFAULT_GEMINI_LAG_HOURS,
+        help=f"Lag threshold in hours for Gemini-synced sources (default: {DEFAULT_GEMINI_LAG_HOURS:g}).",
+    )
+
+    sbw = sub.add_parser(
+        "sb-watchdog",
+        help="Inspect SB 01 Now for [needs-gemini: ...] items and >48h Gemini source lag.",
+    )
+    sbw.add_argument("--sb-cache-dir", type=Path, default=DEFAULT_SB_CACHE_DIR)
+    sbw.add_argument(
+        "--gemini-lag-hours",
+        type=float,
+        default=DEFAULT_GEMINI_LAG_HOURS,
+        help=f"Lag threshold in hours for Gemini-synced sources (default: {DEFAULT_GEMINI_LAG_HOURS:g}).",
+    )
 
     sbd = sub.add_parser(
         "sb-complete",
@@ -1688,17 +1869,31 @@ def build_parser() -> argparse.ArgumentParser:
     nh_cmd.add_argument("--file", help="Optional output--*.md filename in wiki.")
     nh_cmd.add_argument("--message", required=True, help="Concise 1-2 line takeaway or question for the user.")
 
-    sub.add_parser(
+    spc_cmd = sub.add_parser(
         "spokesperson-check",
-        help="Read-only check for @runai: reports unsent outbox items and new/updated output--*.md files.",
+        help="Read-only check for @runai: reports unsent outbox items, new/updated output--*.md files, and unseen Gemini watchdog alerts.",
+    )
+    spc_cmd.add_argument("--sb-cache-dir", type=Path, default=DEFAULT_SB_CACHE_DIR)
+    spc_cmd.add_argument(
+        "--gemini-lag-hours",
+        type=float,
+        default=DEFAULT_GEMINI_LAG_HOURS,
+        help=f"Lag threshold in hours for Gemini-synced sources (default: {DEFAULT_GEMINI_LAG_HOURS:g}).",
     )
 
     sms_cmd = sub.add_parser(
         "spokesperson-mark-sent",
-        help="Mark current outbox items and output--*.md watermarks as delivered to the user.",
+        help="Mark current outbox items, output--*.md watermarks, and Gemini watchdog alerts as delivered.",
     )
     sms_cmd.add_argument("--agent", default="runai")
     sms_cmd.add_argument("--notes", help="Optional note for the SENT log.")
+    sms_cmd.add_argument("--sb-cache-dir", type=Path, default=DEFAULT_SB_CACHE_DIR)
+    sms_cmd.add_argument(
+        "--gemini-lag-hours",
+        type=float,
+        default=DEFAULT_GEMINI_LAG_HOURS,
+        help=f"Lag threshold in hours for Gemini-synced sources (default: {DEFAULT_GEMINI_LAG_HOURS:g}).",
+    )
 
     return p
 
@@ -1715,6 +1910,7 @@ def main() -> int:
         "heartbeat": cmd_heartbeat,
         "rename": cmd_rename,
         "sb-check": cmd_sb_check,
+        "sb-watchdog": cmd_sb_watchdog,
         "sb-complete": cmd_sb_complete,
         "add-task": cmd_add_task,
         "claim-task": cmd_claim_task,
