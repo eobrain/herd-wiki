@@ -14,6 +14,9 @@ import random
 import re
 import subprocess
 import sys
+from typing import Any
+
+DEFAULT_REVIEW_TIMEOUT_MINUTES = 90
 
 DEFAULT_WIKI_DIR = Path(
     os.environ.get("HERD_WIKI_DIR", str(Path.home() / "src/herd/wiki"))
@@ -221,9 +224,123 @@ def rewrite_links_in_wiki(wiki_dir: Path, old_name: str, new_name: str) -> int:
     return updated_count
 
 
-def parse_agent_cards(wiki_dir: Path) -> dict[str, dict[str, str]]:
+def normalize_effort_bucket(effort: str | None) -> str:
+    e = (effort or "unspecified").strip().lower()
+    if not e or e in ("—", "-", "none", "null", "unspecified", "unknown"):
+        return "unspecified"
+    try:
+        val = float(e)
+        if val <= 0.35:
+            return "low"
+        if val < 0.80:
+            return "medium"
+        return "high"
+    except ValueError:
+        pass
+    if e in ("low", "min", "minimal"):
+        return "low"
+    if e in ("medium", "med", "normal", "standard"):
+        return "medium"
+    if e in ("high", "xhigh", "max"):
+        return "high"
+    return "unspecified"
+
+
+def compute_capability_tier(model: str | None, effort: str | None) -> int:
+    """Map declared (model, effort) to capability tier 1 (light), 2 (standard), or 3 (thorough)."""
+    m = (model or "unspecified").strip().lower()
+    bucket = normalize_effort_bucket(effort)
+    if bucket == "low" or any(tok in m for tok in ("haiku", "lite")):
+        return 1
+    if "flash" in m:
+        return 2 if bucket == "high" else 1
+    if any(tok in m for tok in ("carbon", "opus", "orchestrator")):
+        return 3
+    if bucket == "high":
+        return 3
+    return 2
+
+
+def infer_model_family(runtime: str | None, model: str | None) -> str:
+    r = (runtime or "").strip().lower()
+    m = (model or "").strip().lower()
+    if "claude" in r or any(tok in m for tok in ("claude", "sonnet", "opus", "haiku", "fable")):
+        return "claude"
+    if "antigravity" in r or any(
+        tok in m for tok in ("gemini", "flash", "hydrogen", "argon", "carbon")
+    ):
+        return "gemini"
+    return "unspecified"
+
+
+def format_agent_spec(
+    runtime: str | None, model: str | None, effort: str | None, tier: int | None = None
+) -> str:
+    r = (runtime or "unspecified").strip().lower() or "unspecified"
+    m = (model or "unspecified").strip().lower() or "unspecified"
+    e = (effort or "unspecified").strip().lower() or "unspecified"
+    t = tier if tier is not None else compute_capability_tier(m, e)
+    if r == "unspecified" and m == "unspecified" and e == "unspecified":
+        return f"unspecified (T{t})"
+    base = f"{m}@{e}"
+    if r != "unspecified":
+        base = f"{r}:{base}"
+    return f"{base} (T{t})"
+
+
+def upsert_card_meta_lines(
+    body: str,
+    runtime: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+) -> str:
+    """Update or insert Runtime, Model, Effort, and Capability Tier lines on an agent card."""
+    rt_m = re.search(r"^- \*\*Runtime\*\*:\s*(.+)$", body, re.MULTILINE)
+    md_m = re.search(r"^- \*\*Model\*\*:\s*(.+)$", body, re.MULTILINE)
+    ef_m = re.search(r"^- \*\*Effort\*\*:\s*(.+)$", body, re.MULTILINE)
+
+    cur_rt = rt_m.group(1).strip().strip("`") if rt_m else "unspecified"
+    cur_md = md_m.group(1).strip().strip("`") if md_m else "unspecified"
+    cur_ef = ef_m.group(1).strip().strip("`") if ef_m else "unspecified"
+
+    new_rt = runtime.strip().lower() if runtime else cur_rt
+    new_md = model.strip().lower() if model else cur_md
+    new_ef = effort.strip().lower() if effort else cur_ef
+    tier = compute_capability_tier(new_md, new_ef)
+
+    fields = [
+        ("Runtime", f"`{new_rt}`"),
+        ("Model", f"`{new_md}`"),
+        ("Effort", f"`{new_ef}`"),
+        ("Capability Tier", f"`T{tier}`"),
+    ]
+    for label, rendered in fields:
+        pat = rf"^- \*\*{re.escape(label)}\*\*:\s*.+$"
+        line = f"- **{label}**: {rendered}"
+        if re.search(pat, body, re.MULTILINE):
+            body = re.sub(pat, line, body, count=1, flags=re.MULTILINE)
+        else:
+            # Insert after Agent Name or Status
+            anchor = r"^(- \*\*Agent Name\*\*:\s*.+)$"
+            if re.search(anchor, body, re.MULTILINE):
+                body = re.sub(anchor, rf"\1\n{line}", body, count=1, flags=re.MULTILINE)
+            else:
+                body = line + "\n" + body
+    # Ensure consistent ordering if newly inserted right after Agent Name
+    meta_block = "\n".join(f"- **{label}**: {rendered}" for label, rendered in fields)
+    body = re.sub(
+        r"(^- \*\*Agent Name\*\*:\s*.+\n)(?:- \*\*(?:Runtime|Model|Effort|Capability Tier)\*\*:\s*.+\n)+",
+        rf"\1{meta_block}\n",
+        body,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    return body
+
+
+def parse_agent_cards(wiki_dir: Path) -> dict[str, dict[str, Any]]:
     """Return mapping of agent_name -> metadata from agent-<name>--*.md files."""
-    agents: dict[str, dict[str, str]] = {}
+    agents: dict[str, dict[str, Any]] = {}
     for p in sorted(wiki_dir.glob("agent-*--*.md")):
         m = AGENT_FILE_RE.match(p.name)
         if not m:
@@ -237,6 +354,20 @@ def parse_agent_cards(wiki_dir: Path) -> dict[str, dict[str, str]]:
         cron_m = re.search(
             r"^- \*\*Wakeup Cron\*\*:\s*(.+)$", body, re.MULTILINE
         )
+        rt_m = re.search(r"^- \*\*Runtime\*\*:\s*(.+)$", body, re.MULTILINE)
+        md_m = re.search(r"^- \*\*Model\*\*:\s*(.+)$", body, re.MULTILINE)
+        ef_m = re.search(r"^- \*\*Effort\*\*:\s*(.+)$", body, re.MULTILINE)
+
+        runtime = rt_m.group(1).strip().strip("`") if rt_m else "unspecified"
+        model = md_m.group(1).strip().strip("`") if md_m else "unspecified"
+        effort = ef_m.group(1).strip().strip("`") if ef_m else "unspecified"
+        tier = compute_capability_tier(model, effort)
+        family = infer_model_family(runtime, model)
+        spec = format_agent_spec(runtime, model, effort, tier)
+        has_model_meta = bool(
+            (md_m and model != "unspecified") or (ef_m and effort != "unspecified")
+        )
+
         agents[name] = {
             "name": name,
             "filename": p.name,
@@ -245,6 +376,13 @@ def parse_agent_cards(wiki_dir: Path) -> dict[str, dict[str, str]]:
                 dt.datetime.fromtimestamp(p.stat().st_mtime, dt.timezone.utc)
             ),
             "wakeup_cron": cron_m.group(1).strip().strip("`") if cron_m else "",
+            "runtime": runtime,
+            "model": model,
+            "effort": effort,
+            "tier": tier,
+            "family": family,
+            "spec": spec,
+            "has_model_meta": has_model_meta,
         }
     return agents
 
@@ -277,17 +415,17 @@ def sync_roster_table(wiki_dir: Path) -> None:
         return
     agents = parse_agent_cards(wiki_dir)
     lines = [
-        "| Agent Name | Status | Last Heartbeat (UTC) | Presence Page |",
-        "| :--- | :--- | :--- | :--- |",
+        "| Agent Name | Status | Model / Effort (Tier) | Last Heartbeat (UTC) | Presence Page |",
+        "| :--- | :--- | :--- | :--- | :--- |",
     ]
     if not agents:
-        lines.append("| *(none yet)* | — | — | — |")
+        lines.append("| *(none yet)* | — | — | — | — |")
     else:
         for name in sorted(agents):
             info = agents[name]
             fn = info["filename"]
             lines.append(
-                f"| `{name}` | `{info['status']}` | `{info['heartbeat']}` | [{fn}]({fn}) |"
+                f"| `{name}` | `{info['status']}` | `{info['spec']}` | `{info['heartbeat']}` | [{fn}]({fn}) |"
             )
     text = roster_path.read_text(encoding="utf-8")
     updated = replace_between_markers(
@@ -301,16 +439,20 @@ def sync_roster_table(wiki_dir: Path) -> None:
 
 def collect_taken_names(wiki_dir: Path) -> set[str]:
     taken = set(parse_agent_cards(wiki_dir).keys())
+    ignored_tokens = {
+        "open", "done", "p1", "p2", "p3", "active", "idle", "working",
+        "reviewing", "coordinating", "none", "verified", "corrected",
+        "unspecified", "antigravity", "sonnet", "opus", "haiku", "flash",
+        "hydrogen", "argon", "carbon", "low", "medium", "high", "xhigh",
+        "max", "t1", "t2", "t3",
+    }
     for fname in (ROSTER_FILE, board_filename(wiki_dir)):
         fpath = wiki_dir / fname
         if fpath.exists():
             txt = fpath.read_text(encoding="utf-8")
             for m in re.finditer(r"`([a-z][a-z0-9]{1,24})`", txt):
                 cand = m.group(1).lower()
-                if not cand.startswith("t-") and cand not in {
-                    "open", "done", "p1", "p2", "p3", "active", "idle", "working",
-                    "coordinating", "none",
-                }:
+                if not cand.startswith("t-") and cand not in ignored_tokens:
                     taken.add(cand)
     return taken
 
@@ -431,9 +573,18 @@ def cmd_register_agent(args: argparse.Namespace) -> int:
         now = iso_utc()
         minute, wakeup_cron = pick_random_cron(wiki_dir, exclude_agent=chosen)
         b_file = board_filename(wiki_dir)
+        runtime_val = (args.runtime or "unspecified").strip().lower() or "unspecified"
+        model_val = (args.model or "unspecified").strip().lower() or "unspecified"
+        effort_val = (args.effort or "unspecified").strip().lower() or "unspecified"
+        tier_val = compute_capability_tier(model_val, effort_val)
+        spec_val = format_agent_spec(runtime_val, model_val, effort_val, tier_val)
         content = f"""# Agent Presence: `{chosen}`
 
 - **Agent Name**: `{chosen}`
+- **Runtime**: `{runtime_val}`
+- **Model**: `{model_val}`
+- **Effort**: `{effort_val}`
+- **Capability Tier**: `T{tier_val}`
 - **Status**: `active`
 - **Last Heartbeat (UTC)**: {now}
 - **Wakeup Cron**: `{wakeup_cron}`
@@ -451,7 +602,7 @@ Related coordination pages:
 
 ## Active Coordination Notes
 
-- **{now} (`@{chosen}`)**: Registered in the herd and ready to coordinate.
+- **{now} (`@{chosen}`)**: Registered in the herd (`{spec_val}`) and ready to coordinate.
 """
         atomic_write(wiki_dir / filename, content)
         sync_roster_table(wiki_dir)
@@ -460,9 +611,64 @@ Related coordination pages:
                 {
                     "agent": chosen,
                     "presence_file": filename,
+                    "runtime": runtime_val,
+                    "model": model_val,
+                    "effort": effort_val,
+                    "tier": tier_val,
+                    "spec": spec_val,
                     "wakeup_minute": minute,
                     "wakeup_cron": wakeup_cron,
                     "utc": now,
+                }
+            )
+        )
+    return 0
+
+
+def cmd_set_agent_meta(args: argparse.Namespace) -> int:
+    wiki_dir: Path = args.wiki_dir
+    agent = args.agent.lower().strip()
+
+    with FileLock(args.lock_file):
+        cards = parse_agent_cards(wiki_dir)
+        if agent not in cards:
+            print(
+                f"ERROR: Agent '{agent}' has no presence card. Run register-agent first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        card_path = wiki_dir / cards[agent]["filename"]
+        body = card_path.read_text(encoding="utf-8")
+        body = upsert_card_meta_lines(
+            body,
+            runtime=args.runtime,
+            model=args.model,
+            effort=args.effort,
+        )
+        now = iso_utc()
+        if args.touch_heartbeat:
+            body = re.sub(
+                r"^- \*\*Last Heartbeat \(UTC\)\*\*:\s*.+$",
+                f"- **Last Heartbeat (UTC)**: {now}",
+                body,
+                count=1,
+                flags=re.MULTILINE,
+            )
+        atomic_write(card_path, body)
+        sync_roster_table(wiki_dir)
+        updated_card = parse_agent_cards(wiki_dir)[agent]
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "agent": agent,
+                    "runtime": updated_card["runtime"],
+                    "model": updated_card["model"],
+                    "effort": updated_card["effort"],
+                    "tier": updated_card["tier"],
+                    "spec": updated_card["spec"],
+                    "presence_file": updated_card["filename"],
                 }
             )
         )
@@ -558,31 +764,71 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
         due = (last_dt is None) or ((now - last_dt).total_seconds() >= interval)
         sb_sync_due = due and not lease_active
 
-    # 2. Check board for OPEN tasks, own IN_PROGRESS tasks, or stale IN_PROGRESS tasks
+    # 2. Check board for OPEN, IN_PROGRESS, NEEDS_REVIEW, and IN_REVIEW tasks
     open_tasks: list[dict[str, str]] = []
     own_in_progress_tasks: list[dict[str, str]] = []
     stale_in_progress_tasks: list[dict[str, str]] = []
+    review_tasks: list[dict[str, Any]] = []
+    own_in_review_tasks: list[dict[str, Any]] = []
+    stale_in_review_tasks: list[dict[str, Any]] = []
+
+    agent_tier = int(cards[agent]["tier"]) if (agent and agent in cards) else 2
+    agent_family = str(cards[agent]["family"]) if (agent and agent in cards) else "unspecified"
+    agent_meta_declared = bool(cards[agent]["has_model_meta"]) if (agent and agent in cards) else False
+
     b_file = board_filename(wiki_dir)
     in_file = human_inbox_filename(wiki_dir)
     out_file = human_outbox_filename(wiki_dir)
     board_path = wiki_dir / b_file
     if board_path.exists():
-        rows = parse_tasks_table(board_path.read_text(encoding="utf-8"))
+        board_txt = board_path.read_text(encoding="utf-8")
+        rows = parse_tasks_table(board_txt)
+        rev_state = load_board_review_state(board_txt)
+        prio_rank = {"P1": 1, "P2": 2, "P3": 3}
+
         for r in rows:
-            if r["status"] == "OPEN":
+            tid = r["id"]
+            st = r["status"]
+            author = r["author"]
+            reviewer = r["reviewer"]
+            rmeta = rev_state.get(tid, {})
+            author_tier = int(
+                rmeta.get("author_tier")
+                or (cards[author]["tier"] if author in cards else 2)
+            )
+            author_family = str(
+                rmeta.get("author_family")
+                or (cards[author]["family"] if author in cards else "unspecified")
+            )
+            author_spec = str(
+                rmeta.get("author_spec")
+                or (cards[author]["spec"] if author in cards else f"unspecified (T{author_tier})")
+            )
+            min_reviewer_tier = max(2, author_tier)
+            eligible_reviewer = (
+                (agent is None)
+                or (agent != author and agent_tier >= min_reviewer_tier)
+            )
+            cross_family = bool(
+                agent_family != "unspecified"
+                and author_family != "unspecified"
+                and agent_family != author_family
+            )
+
+            if st == "OPEN":
                 open_tasks.append(
-                    {"id": r["id"], "priority": r["priority"], "summary": r["summary"]}
+                    {"id": tid, "priority": r["priority"], "summary": r["summary"]}
                 )
-            elif r["status"] == "IN_PROGRESS":
-                if agent and r["owner"] == agent:
+            elif st == "IN_PROGRESS":
+                if agent and author == agent:
                     own_in_progress_tasks.append(
-                        {"id": r["id"], "priority": r["priority"], "summary": r["summary"]}
+                        {"id": tid, "priority": r["priority"], "summary": r["summary"]}
                     )
                 else:
                     claimed_dt = parse_iso_utc(r["updated"])
                     owner_hb = (
-                        parse_iso_utc(cards[r["owner"]].get("heartbeat"))
-                        if r["owner"] in cards
+                        parse_iso_utc(cards[author].get("heartbeat"))
+                        if author in cards
                         else None
                     )
                     claim_stale = (
@@ -596,12 +842,72 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
                     if claim_stale and hb_stale:
                         stale_in_progress_tasks.append(
                             {
-                                "id": r["id"],
-                                "owner": r["owner"],
+                                "id": tid,
+                                "owner": author,
                                 "updated": r["updated"],
                                 "summary": r["summary"],
                             }
                         )
+            elif st == "NEEDS_REVIEW":
+                if eligible_reviewer:
+                    review_tasks.append(
+                        {
+                            "id": tid,
+                            "priority": r["priority"],
+                            "author": author,
+                            "author_spec": author_spec,
+                            "output_file": rmeta.get("output_file"),
+                            "cross_family": cross_family,
+                            "submitted_utc": rmeta.get("submitted_utc") or r["updated"],
+                            "summary": r["summary"],
+                        }
+                    )
+            elif st == "IN_REVIEW":
+                if agent and reviewer == agent:
+                    own_in_review_tasks.append(
+                        {
+                            "id": tid,
+                            "priority": r["priority"],
+                            "author": author,
+                            "output_file": rmeta.get("output_file"),
+                            "summary": r["summary"],
+                        }
+                    )
+                elif eligible_reviewer:
+                    claimed_dt = parse_iso_utc(r["updated"])
+                    rev_hb = (
+                        parse_iso_utc(cards[reviewer].get("heartbeat"))
+                        if reviewer in cards
+                        else None
+                    )
+                    claim_stale = (
+                        claimed_dt is not None
+                        and (now - claimed_dt).total_seconds() >= args.stale_minutes * 60
+                    )
+                    hb_stale = (
+                        rev_hb is None
+                        or (now - rev_hb).total_seconds() >= args.stale_minutes * 60
+                    )
+                    if claim_stale and hb_stale:
+                        stale_in_review_tasks.append(
+                            {
+                                "id": tid,
+                                "priority": r["priority"],
+                                "author": author,
+                                "stale_reviewer": reviewer,
+                                "output_file": rmeta.get("output_file"),
+                                "updated": r["updated"],
+                                "summary": r["summary"],
+                            }
+                        )
+
+        review_tasks.sort(
+            key=lambda item: (
+                0 if item["cross_family"] else 1,
+                prio_rank.get(str(item["priority"]), 9),
+                str(item["id"]),
+            )
+        )
 
     # 3. Check human inbox and kb-*, collab--*, or custom .md files modified since last heartbeat
     human_inbox_updated = False
@@ -658,6 +964,12 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
     if human_inbox_updated:
         reasons.append("human_inbox_updated")
         updated_wiki_files.insert(0, in_file)
+    if own_in_review_tasks:
+        reasons.append("own_in_review_tasks")
+    if review_tasks:
+        reasons.append("review_tasks")
+    if stale_in_review_tasks:
+        reasons.append("stale_in_review_tasks")
     if sb_sync_due:
         reasons.append("sb_sync_due")
     if own_in_progress_tasks:
@@ -670,14 +982,25 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
         reasons.append("updated_wiki_files")
 
     action_needed = bool(reasons)
+    meta_hint = (
+        ""
+        if agent_meta_declared
+        else " Also pass --runtime, --model, and --effort on heartbeat/set-agent-meta so your capability tier is recorded on the roster."
+    )
     if skill_updated:
         next_step = (
-            f"SKILL.md was updated since your last heartbeat (new single-spokesperson @runai protocol). "
-            f"Re-read {skill_md_path} first; if no other tasks are open, call heartbeat --status idle once to record the reload and return to waiting."
+            f"SKILL.md was updated since your last heartbeat (peer-review & model/effort declaration protocol). "
+            f"Re-read {skill_md_path} first.{meta_hint} If no review or open tasks need work, call heartbeat --status idle once to record the reload and return to waiting."
+        )
+    elif review_tasks or own_in_review_tasks:
+        next_step = (
+            "Prioritize peer-reviewing completed peer deliverables first ('claim-review' -> verify against Second Brain/repo & edit output--*.md in place if needed -> 'complete-review') before claiming new OPEN tasks."
+            + meta_hint
         )
     elif action_needed:
         next_step = (
             "Inspect only the due/updated items above; if after checking updated_wiki_files no new task is warranted, call heartbeat --status idle once to advance your watermark and return to waiting."
+            + meta_hint
         )
     else:
         next_step = (
@@ -687,11 +1010,17 @@ def cmd_quick_check(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "agent": agent,
+                "agent_spec": cards[agent]["spec"] if (agent and agent in cards) else None,
+                "agent_tier": agent_tier if (agent and agent in cards) else None,
+                "agent_meta_declared": agent_meta_declared,
                 "utc": iso_utc(now),
                 "last_heartbeat_utc": iso_utc(agent_hb) if agent_hb else None,
                 "action_needed": action_needed,
                 "reasons": reasons,
                 "sb_sync_due": sb_sync_due,
+                "review_tasks": review_tasks,
+                "own_in_review_tasks": own_in_review_tasks,
+                "stale_in_review_tasks": stale_in_review_tasks,
                 "open_tasks": open_tasks,
                 "own_in_progress_tasks": own_in_progress_tasks,
                 "stale_in_progress_tasks": stale_in_progress_tasks,
@@ -721,6 +1050,14 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
         old_path = wiki_dir / old_filename
         body = old_path.read_text(encoding="utf-8")
         now = iso_utc()
+
+        if args.runtime or args.model or args.effort:
+            body = upsert_card_meta_lines(
+                body,
+                runtime=args.runtime,
+                model=args.model,
+                effort=args.effort,
+            )
 
         body = re.sub(
             r"^- \*\*Status\*\*:\s*.+$",
@@ -758,11 +1095,14 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
             rewritten = rewrite_links_in_wiki(wiki_dir, old_filename, new_filename)
 
         sync_roster_table(wiki_dir)
+        updated_card = parse_agent_cards(wiki_dir)[agent]
         print(
             json.dumps(
                 {
                     "agent": agent,
                     "status": args.status,
+                    "spec": updated_card["spec"],
+                    "tier": updated_card["tier"],
                     "presence_file": new_filename,
                     "links_updated_in_files": rewritten,
                     "utc": now,
@@ -797,6 +1137,17 @@ def cmd_rename(args: argparse.Namespace) -> int:
         if old_name != new_name:
             os.replace(old_path, new_path)
             updated = rewrite_links_in_wiki(wiki_dir, old_name, new_name)
+            board_path = wiki_dir / board_filename(wiki_dir)
+            if board_path.exists():
+                btxt = board_path.read_text(encoding="utf-8")
+                rstate = load_board_review_state(btxt)
+                changed_state = False
+                for entry in rstate.values():
+                    if entry.get("output_file") == old_name:
+                        entry["output_file"] = new_name
+                        changed_state = True
+                if changed_state:
+                    atomic_write(board_path, save_board_review_state(btxt, rstate))
         else:
             updated = 0
         if old_name.startswith("agent-") or new_name.startswith("agent-"):
@@ -1155,6 +1506,61 @@ def cmd_sb_complete(args: argparse.Namespace) -> int:
     return 0
 
 
+BOARD_REVIEW_START = "<!-- BOARD_REVIEW_STATE_START -->"
+BOARD_REVIEW_END = "<!-- BOARD_REVIEW_STATE_END -->"
+
+
+def load_board_review_state(board_text: str) -> dict[str, dict[str, Any]]:
+    if BOARD_REVIEW_START not in board_text or BOARD_REVIEW_END not in board_text:
+        return {}
+    raw = extract_between_markers(board_text, BOARD_REVIEW_START, BOARD_REVIEW_END)
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_board_review_state(
+    board_text: str, state: dict[str, dict[str, Any]]
+) -> str:
+    fenced = "```json\n" + json.dumps(state, indent=2, sort_keys=True) + "\n```"
+    if BOARD_REVIEW_START in board_text and BOARD_REVIEW_END in board_text:
+        return replace_between_markers(
+            board_text, BOARD_REVIEW_START, BOARD_REVIEW_END, fenced
+        )
+    if not state:
+        return board_text
+    section = (
+        "\n\n## Pending Peer-Review Metadata\n\n"
+        f"{BOARD_REVIEW_START}\n{fenced}\n{BOARD_REVIEW_END}\n"
+    )
+    return board_text.rstrip() + section
+
+
+def stamp_output_provenance(output_path: Path, provenance_text: str) -> None:
+    """Insert or update `- **Herd Provenance**: ...` near the top of output--*.md."""
+    if not output_path.exists():
+        return
+    body = output_path.read_text(encoding="utf-8")
+    line = f"- **Herd Provenance**: {provenance_text}"
+    pat = r"^- \*\*Herd Provenance\*\*:\s*.+$"
+    if re.search(pat, body, re.MULTILINE):
+        updated = re.sub(pat, line, body, count=1, flags=re.MULTILINE)
+    else:
+        h1_m = re.search(r"^#\s+.+$", body, re.MULTILINE)
+        if h1_m:
+            insert_at = h1_m.end()
+            updated = body[:insert_at] + f"\n\n{line}" + body[insert_at:]
+        else:
+            updated = f"{line}\n\n{body}"
+    if updated != body:
+        atomic_write(output_path, updated)
+
+
 def parse_tasks_table(board_text: str) -> list[dict[str, str]]:
     block = extract_between_markers(
         board_text, "<!-- TASKS_TABLE_START -->", "<!-- TASKS_TABLE_END -->"
@@ -1162,7 +1568,11 @@ def parse_tasks_table(board_text: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for line in block.splitlines():
         s = line.strip()
-        if not s.startswith("|") or "Task Summary" in s or set(s.replace("|", "").strip()) <= {"-", ":", " "}:
+        if (
+            not s.startswith("|")
+            or "Task Summary" in s
+            or set(s.replace("|", "").strip()) <= {"-", ":", " "}
+        ):
             continue
         cols = [c.strip() for c in s.strip("|").split("|")]
         if len(cols) < 6:
@@ -1170,14 +1580,29 @@ def parse_tasks_table(board_text: str) -> list[dict[str, str]]:
         tid = cols[0].strip("` ")
         if tid.startswith("*("):
             continue
+        if len(cols) >= 7:
+            status = cols[2].strip("` ")
+            author = cols[3].strip("`@ ")
+            reviewer = cols[4].strip("`@ ")
+            updated = cols[5].strip("` ")
+            summary = cols[6].strip()
+        else:
+            status = cols[2].strip("` ")
+            author = cols[3].strip("`@ ")
+            reviewer = "—"
+            updated = cols[4].strip("` ")
+            summary = cols[5].strip()
+        owner = reviewer if status == "IN_REVIEW" and reviewer not in ("—", "-", "") else author
         rows.append(
             {
                 "id": tid,
                 "priority": cols[1].strip("` "),
-                "status": cols[2].strip("` "),
-                "owner": cols[3].strip("` "),
-                "updated": cols[4].strip("` "),
-                "summary": cols[5].strip(),
+                "status": status,
+                "owner": owner,
+                "author": author,
+                "reviewer": reviewer,
+                "updated": updated,
+                "summary": summary,
             }
         )
     return rows
@@ -1185,28 +1610,33 @@ def parse_tasks_table(board_text: str) -> list[dict[str, str]]:
 
 def format_tasks_table(rows: list[dict[str, str]]) -> str:
     prio_rank = {"P1": 1, "P2": 2, "P3": 3}
-    status_rank = {"IN_PROGRESS": 0, "OPEN": 1}
+    status_rank = {"IN_REVIEW": 0, "NEEDS_REVIEW": 1, "IN_PROGRESS": 2, "OPEN": 3}
     sorted_rows = sorted(
         rows,
         key=lambda r: (
-            status_rank.get(r["status"], 2),
+            status_rank.get(r["status"], 4),
             prio_rank.get(r["priority"], 9),
             r["id"],
         ),
     )
     lines = [
-        "| ID | Priority | Status | Owner | Claimed / Updated (UTC) | Task Summary & Expected Deliverable |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        "| ID | Priority | Status | Author | Reviewer | Claimed / Updated (UTC) | Task Summary & Expected Deliverable |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
     if not sorted_rows:
-        lines.append("| *(none)* | — | — | — | — | *(No open tasks right now — scan wiki & Second Brain to propose new helpful tasks.)* |")
+        lines.append(
+            "| *(none)* | — | — | — | — | — | *(No open or pending-review tasks right now — scan wiki & Second Brain to propose new helpful tasks.)* |"
+        )
     else:
         for r in sorted_rows:
-            owner_fmt = f"`{r['owner']}`" if r["owner"] not in ("—", "-", "") else "—"
+            auth_val = r.get("author") or r.get("owner") or "—"
+            rev_val = r.get("reviewer") or "—"
+            auth_fmt = f"`@{auth_val}`" if auth_val not in ("—", "-", "") else "—"
+            rev_fmt = f"`@{rev_val}`" if rev_val not in ("—", "-", "") else "—"
             upd_fmt = f"`{r['updated']}`" if r["updated"] not in ("—", "-", "") else "—"
             safe_summary = r["summary"].replace("|", "\\|")
             lines.append(
-                f"| `{r['id']}` | `{r['priority']}` | `{r['status']}` | {owner_fmt} | {upd_fmt} | {safe_summary} |"
+                f"| `{r['id']}` | `{r['priority']}` | `{r['status']}` | {auth_fmt} | {rev_fmt} | {upd_fmt} | {safe_summary} |"
             )
     return "\n".join(lines)
 
@@ -1239,6 +1669,8 @@ def cmd_add_task(args: argparse.Namespace) -> int:
                 "priority": args.priority.upper(),
                 "status": "OPEN",
                 "owner": "—",
+                "author": "—",
+                "reviewer": "—",
                 "updated": now_str,
                 "summary": summary,
             }
@@ -1271,7 +1703,22 @@ def cmd_claim_task(args: argparse.Namespace) -> int:
             print(f"ERROR: Task '{target_id}' not found on active board.", file=sys.stderr)
             return 1
 
-        if match_row["status"] == "IN_PROGRESS" and match_row["owner"] != agent:
+        if match_row["status"] in ("NEEDS_REVIEW", "IN_REVIEW"):
+            print(
+                json.dumps(
+                    {
+                        "claimed": False,
+                        "task_id": target_id,
+                        "status": match_row["status"],
+                        "reason": f"Task {target_id} is already authored and in {match_row['status']}. Use 'claim-review' instead of 'claim-task'.",
+                    }
+                ),
+                file=sys.stderr,
+            )
+            return 1
+
+        cur_author = match_row["author"]
+        if match_row["status"] == "IN_PROGRESS" and cur_author != agent:
             claimed_dt = parse_iso_utc(match_row["updated"])
             stale = (
                 claimed_dt is not None
@@ -1283,8 +1730,8 @@ def cmd_claim_task(args: argparse.Namespace) -> int:
                         {
                             "claimed": False,
                             "task_id": target_id,
-                            "owner": match_row["owner"],
-                            "reason": f"Task {target_id} is already IN_PROGRESS by @{match_row['owner']} (since {match_row['updated']}). Pick another task.",
+                            "owner": cur_author,
+                            "reason": f"Task {target_id} is already IN_PROGRESS by @{cur_author} (since {match_row['updated']}). Pick another task.",
                         }
                     ),
                     file=sys.stderr,
@@ -1293,6 +1740,8 @@ def cmd_claim_task(args: argparse.Namespace) -> int:
 
         match_row["status"] = "IN_PROGRESS"
         match_row["owner"] = agent
+        match_row["author"] = agent
+        match_row["reviewer"] = "—"
         match_row["updated"] = now_str
 
         updated = replace_between_markers(
@@ -1334,6 +1783,12 @@ def cmd_complete_task(args: argparse.Namespace) -> int:
         out_name = ""
 
     with FileLock(args.lock_file):
+        cards = parse_agent_cards(wiki_dir)
+        author_card = cards.get(agent, {})
+        author_tier = int(author_card.get("tier") or 2)
+        author_spec = str(author_card.get("spec") or f"unspecified (T{author_tier})")
+        author_family = str(author_card.get("family") or "unspecified")
+
         text = board_path.read_text(encoding="utf-8")
         rows = parse_tasks_table(text)
         match_row = next((r for r in rows if r["id"].upper() == target_id), None)
@@ -1341,14 +1796,81 @@ def cmd_complete_task(args: argparse.Namespace) -> int:
             print(f"ERROR: Task '{target_id}' not found on active board.", file=sys.stderr)
             return 1
 
-        remaining = [r for r in rows if r["id"].upper() != target_id]
         now_str = iso_utc()
+        if not args.skip_review:
+            base_summary = re.sub(r"\s*→\s*\[[^\]]+\]\([^)]+\).*$", "", match_row["summary"]).strip()
+            link_part = f" → [{out_name}]({out_name})" if out_name else ""
+            match_row["status"] = "NEEDS_REVIEW"
+            match_row["author"] = agent
+            match_row["owner"] = agent
+            match_row["reviewer"] = "—"
+            match_row["updated"] = now_str
+            match_row["summary"] = f"{base_summary}{link_part}"
+
+            rev_state = load_board_review_state(text)
+            rev_state[target_id] = {
+                "task_id": target_id,
+                "priority": match_row["priority"],
+                "base_summary": base_summary,
+                "author": agent,
+                "author_spec": author_spec,
+                "author_tier": author_tier,
+                "author_family": author_family,
+                "output_file": out_name or None,
+                "due": (args.due or "").strip() or None,
+                "message": (args.message or "").strip() or None,
+                "author_notes": (args.notes or "").strip() or None,
+                "submitted_utc": now_str,
+                "reviewer": None,
+                "reviewer_spec": None,
+                "review_claimed_utc": None,
+            }
+
+            if out_name:
+                stamp_output_provenance(
+                    wiki_dir / out_name,
+                    f"Authored by `@{agent}` (`{author_spec}`) on {now_str} — *pending peer review*",
+                )
+
+            text = replace_between_markers(
+                text,
+                "<!-- TASKS_TABLE_START -->",
+                "<!-- TASKS_TABLE_END -->",
+                format_tasks_table(rows),
+            )
+            text = save_board_review_state(text, rev_state)
+            atomic_write(board_path, text)
+            print(
+                json.dumps(
+                    {
+                        "completed": False,
+                        "status": "NEEDS_REVIEW",
+                        "task_id": target_id,
+                        "author": agent,
+                        "author_spec": author_spec,
+                        "output_file": out_name or None,
+                        "utc": now_str,
+                        "next_step": "Submitted for peer verification (NEEDS_REVIEW). Do NOT call notify-human yet — a different peer agent (tier >= yours) will verify/correct the output and release the notification to @runai.",
+                    }
+                )
+            )
+            return 0
+
+        # Explicit --skip-review path (admin/trivial status closure only)
+        remaining = [r for r in rows if r["id"].upper() != target_id]
+        rev_state = load_board_review_state(text)
+        rev_state.pop(target_id, None)
         link_part = f" → [{out_name}]({out_name})" if out_name else ""
         note_part = f" — {args.notes.strip()}" if args.notes else ""
         done_line = (
-            f"- **`{target_id}`** ({now_str}, `@{agent}`): "
+            f"- **`{target_id}`** ({now_str}, `@{agent}` [`{author_spec}`], review skipped): "
             f"{match_row['summary']}{link_part}{note_part}"
         )
+        if out_name:
+            stamp_output_provenance(
+                wiki_dir / out_name,
+                f"Authored by `@{agent}` (`{author_spec}`) on {now_str} *(peer review skipped)*",
+            )
 
         text = replace_between_markers(
             text,
@@ -1360,7 +1882,8 @@ def cmd_complete_task(args: argparse.Namespace) -> int:
             text, "<!-- DONE_LIST_START -->", "<!-- DONE_LIST_END -->"
         )
         done_lines = [
-            ln for ln in done_block.splitlines()
+            ln
+            for ln in done_block.splitlines()
             if ln.strip() and not ln.strip().startswith("- *(No completed tasks")
         ]
         done_lines.insert(0, done_line)
@@ -1370,17 +1893,350 @@ def cmd_complete_task(args: argparse.Namespace) -> int:
             "<!-- DONE_LIST_END -->",
             "\n".join(done_lines),
         )
+        text = save_board_review_state(text, rev_state)
         atomic_write(board_path, text)
         print(
             json.dumps(
                 {
                     "completed": True,
+                    "status": "DONE",
                     "task_id": target_id,
                     "agent": agent,
                     "output_file": out_name or None,
                     "utc": now_str,
                     "next_step": "Queue a concise summary for spokesperson @runai via 'herd_wiki.py notify-human' rather than messaging the user directly.",
                 }
+            )
+        )
+    return 0
+
+
+def cmd_claim_review(args: argparse.Namespace) -> int:
+    wiki_dir: Path = args.wiki_dir
+    board_path = wiki_dir / board_filename(wiki_dir)
+    reviewer = args.agent.lower().strip()
+    target_id = args.task_id.upper().strip()
+
+    with FileLock(args.lock_file):
+        cards = parse_agent_cards(wiki_dir)
+        rev_card = cards.get(reviewer, {})
+        rev_tier = int(rev_card.get("tier") or 2)
+        rev_spec = str(rev_card.get("spec") or f"unspecified (T{rev_tier})")
+
+        text = board_path.read_text(encoding="utf-8")
+        rows = parse_tasks_table(text)
+        rev_state = load_board_review_state(text)
+        now = utc_now()
+        now_str = iso_utc(now)
+
+        match_row = next((r for r in rows if r["id"].upper() == target_id), None)
+        if not match_row:
+            print(f"ERROR: Task '{target_id}' not found on active board.", file=sys.stderr)
+            return 1
+
+        if match_row["status"] not in ("NEEDS_REVIEW", "IN_REVIEW"):
+            print(
+                json.dumps(
+                    {
+                        "claimed": False,
+                        "task_id": target_id,
+                        "status": match_row["status"],
+                        "reason": f"Task {target_id} has status '{match_row['status']}', not NEEDS_REVIEW.",
+                    }
+                ),
+                file=sys.stderr,
+            )
+            return 1
+
+        rmeta = rev_state.get(target_id, {})
+        author = str(rmeta.get("author") or match_row["author"]).strip().lower()
+        if reviewer == author:
+            print(
+                json.dumps(
+                    {
+                        "claimed": False,
+                        "task_id": target_id,
+                        "author": author,
+                        "reason": f"Self-review forbidden: @{reviewer} authored {target_id}. A different peer agent must verify it.",
+                    }
+                ),
+                file=sys.stderr,
+            )
+            return 1
+
+        author_tier = int(
+            rmeta.get("author_tier")
+            or (cards[author]["tier"] if author in cards else 2)
+        )
+        min_tier = max(2, author_tier)
+        if rev_tier < min_tier and not args.force:
+            print(
+                json.dumps(
+                    {
+                        "claimed": False,
+                        "task_id": target_id,
+                        "reviewer_tier": rev_tier,
+                        "required_tier": min_tier,
+                        "reason": f"Capability tier floor: @{reviewer} is T{rev_tier} ({rev_spec}), below required T{min_tier} to review @{author}'s T{author_tier} output.",
+                    }
+                ),
+                file=sys.stderr,
+            )
+            return 1
+
+        cur_rev = match_row["reviewer"]
+        if (
+            match_row["status"] == "IN_REVIEW"
+            and cur_rev not in ("—", "-", "", reviewer)
+        ):
+            claimed_dt = parse_iso_utc(match_row["updated"])
+            stale = (
+                claimed_dt is not None
+                and (now - claimed_dt).total_seconds() >= args.stale_minutes * 60
+            )
+            if not stale:
+                print(
+                    json.dumps(
+                        {
+                            "claimed": False,
+                            "task_id": target_id,
+                            "reviewer": cur_rev,
+                            "reason": f"Task {target_id} is already IN_REVIEW by @{cur_rev} (since {match_row['updated']}).",
+                        }
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+
+        match_row["status"] = "IN_REVIEW"
+        match_row["reviewer"] = reviewer
+        match_row["owner"] = reviewer
+        match_row["updated"] = now_str
+
+        rmeta["task_id"] = target_id
+        rmeta["author"] = author
+        rmeta["reviewer"] = reviewer
+        rmeta["reviewer_spec"] = rev_spec
+        rmeta["review_claimed_utc"] = now_str
+        rev_state[target_id] = rmeta
+
+        text = replace_between_markers(
+            text,
+            "<!-- TASKS_TABLE_START -->",
+            "<!-- TASKS_TABLE_END -->",
+            format_tasks_table(rows),
+        )
+        text = save_board_review_state(text, rev_state)
+        atomic_write(board_path, text)
+        print(
+            json.dumps(
+                {
+                    "claimed": True,
+                    "task_id": target_id,
+                    "author": author,
+                    "author_spec": rmeta.get("author_spec"),
+                    "reviewer": reviewer,
+                    "reviewer_spec": rev_spec,
+                    "output_file": rmeta.get("output_file"),
+                    "due": rmeta.get("due"),
+                    "proposed_human_message": rmeta.get("message"),
+                    "author_notes": rmeta.get("author_notes"),
+                    "utc": now_str,
+                },
+                indent=2,
+            )
+        )
+    return 0
+
+
+def cmd_complete_review(args: argparse.Namespace) -> int:
+    wiki_dir: Path = args.wiki_dir
+    board_path = wiki_dir / board_filename(wiki_dir)
+    outbox_path = wiki_dir / human_outbox_filename(wiki_dir)
+    reviewer = args.agent.lower().strip()
+    target_id = args.task_id.upper().strip()
+    verdict = args.verdict.lower().strip()
+
+    with FileLock(args.lock_file):
+        cards = parse_agent_cards(wiki_dir)
+        rev_card = cards.get(reviewer, {})
+        rev_tier = int(rev_card.get("tier") or 2)
+        rev_spec = str(rev_card.get("spec") or f"unspecified (T{rev_tier})")
+
+        text = board_path.read_text(encoding="utf-8")
+        rows = parse_tasks_table(text)
+        rev_state = load_board_review_state(text)
+        match_row = next((r for r in rows if r["id"].upper() == target_id), None)
+        if not match_row:
+            print(f"ERROR: Task '{target_id}' not found on active board.", file=sys.stderr)
+            return 1
+
+        if match_row["status"] not in ("NEEDS_REVIEW", "IN_REVIEW"):
+            print(
+                f"ERROR: Task '{target_id}' is in status '{match_row['status']}', expected NEEDS_REVIEW or IN_REVIEW.",
+                file=sys.stderr,
+            )
+            return 1
+
+        rmeta = rev_state.get(target_id, {})
+        author = str(rmeta.get("author") or match_row["author"]).strip().lower()
+        if reviewer == author:
+            print(
+                f"ERROR: Self-review forbidden: @{reviewer} authored {target_id}.",
+                file=sys.stderr,
+            )
+            return 1
+
+        author_tier = int(
+            rmeta.get("author_tier")
+            or (cards[author]["tier"] if author in cards else 2)
+        )
+        author_spec = str(
+            rmeta.get("author_spec")
+            or (cards[author]["spec"] if author in cards else f"unspecified (T{author_tier})")
+        )
+        min_tier = max(2, author_tier)
+        if rev_tier < min_tier and not args.force:
+            print(
+                f"ERROR: Capability tier floor: @{reviewer} is T{rev_tier}, below T{min_tier} required to verify @{author}'s T{author_tier} output.",
+                file=sys.stderr,
+            )
+            return 1
+
+        out_name = (
+            Path(args.output_file).name
+            if args.output_file
+            else (str(rmeta.get("output_file") or "")).strip()
+        )
+        if out_name and not (wiki_dir / out_name).exists():
+            print(
+                f"ERROR: Deliverable file '{out_name}' does not exist in {wiki_dir}.",
+                file=sys.stderr,
+            )
+            return 1
+
+        now_str = iso_utc()
+        verdict_label = (
+            "Peer-corrected & verified" if verdict == "corrected" else "Peer-verified"
+        )
+        if out_name:
+            stamp_output_provenance(
+                wiki_dir / out_name,
+                f"Authored by `@{author}` (`{author_spec}`) · {verdict_label} by `@{reviewer}` (`{rev_spec}`) on {now_str}",
+            )
+
+        base_summary = str(
+            rmeta.get("base_summary")
+            or re.sub(r"\s*→\s*\[[^\]]+\]\([^)]+\).*$", "", match_row["summary"]).strip()
+        )
+        link_part = f" → [{out_name}]({out_name})" if out_name else ""
+        author_notes = str(rmeta.get("author_notes") or "").strip()
+        rev_notes = args.notes.strip()
+        combined_notes = (
+            f"{author_notes}; {verdict_label} by `@{reviewer}`: {rev_notes}"
+            if author_notes
+            else f"{verdict_label}: {rev_notes}"
+        )
+        done_line = (
+            f"- **`{target_id}`** ({now_str}, author `@{author}` [`{author_spec}`], "
+            f"`{verdict}` by `@{reviewer}` [`{rev_spec}`]): "
+            f"{base_summary}{link_part} — {combined_notes}"
+        )
+
+        remaining = [r for r in rows if r["id"].upper() != target_id]
+        rev_state.pop(target_id, None)
+
+        text = replace_between_markers(
+            text,
+            "<!-- TASKS_TABLE_START -->",
+            "<!-- TASKS_TABLE_END -->",
+            format_tasks_table(remaining),
+        )
+        done_block = extract_between_markers(
+            text, "<!-- DONE_LIST_START -->", "<!-- DONE_LIST_END -->"
+        )
+        done_lines = [
+            ln
+            for ln in done_block.splitlines()
+            if ln.strip() and not ln.strip().startswith("- *(No completed tasks")
+        ]
+        done_lines.insert(0, done_line)
+        text = replace_between_markers(
+            text,
+            "<!-- DONE_LIST_START -->",
+            "<!-- DONE_LIST_END -->",
+            "\n".join(done_lines),
+        )
+        text = save_board_review_state(text, rev_state)
+        atomic_write(board_path, text)
+
+        # Queue or upgrade human-outbox notification now that review passed
+        queued_mid: str | None = None
+        due_val = (args.due or rmeta.get("due") or "—").strip() or "—"
+        human_msg = (
+            (args.message or rmeta.get("message") or "").strip()
+            or f"{base_summary} ({rev_notes})"
+        )
+        badge = f"[{verdict_label} by @{reviewer} ({rev_spec}); authored by @{author} ({author_spec})]"
+        if not args.no_notify and outbox_path.exists():
+            out_txt = outbox_path.read_text(encoding="utf-8")
+            out_rows = parse_outbox_pending(out_txt)
+            deliv_cell = f"[{out_name}]({out_name})" if out_name else "—"
+            existing_row = next(
+                (
+                    r
+                    for r in out_rows
+                    if out_name and out_name in r.get("deliverable", "")
+                ),
+                None,
+            )
+            if existing_row:
+                queued_mid = existing_row["id"]
+                if args.due:
+                    existing_row["due"] = due_val
+                base_msg = args.message.strip() if args.message else existing_row["summary"]
+                if "Peer-" not in base_msg:
+                    existing_row["summary"] = f"{base_msg} {badge}"
+                else:
+                    existing_row["summary"] = base_msg
+            else:
+                nums = [0] + [int(m.group(1)) for m in re.finditer(r"M-(\d{3,})", out_txt)]
+                queued_mid = f"M-{max(nums) + 1:03d}"
+                out_rows.append(
+                    {
+                        "id": queued_mid,
+                        "created": now_str,
+                        "agent": author,
+                        "kind": "deliverable",
+                        "due": due_val,
+                        "deliverable": deliv_cell,
+                        "summary": f"{human_msg} {badge}",
+                    }
+                )
+            updated_out = replace_between_markers(
+                out_txt,
+                "<!-- OUTBOX_PENDING_START -->",
+                "<!-- OUTBOX_PENDING_END -->",
+                format_outbox_pending(out_rows),
+            )
+            atomic_write(outbox_path, updated_out)
+
+        print(
+            json.dumps(
+                {
+                    "completed": True,
+                    "status": "DONE",
+                    "task_id": target_id,
+                    "author": author,
+                    "author_spec": author_spec,
+                    "reviewer": reviewer,
+                    "reviewer_spec": rev_spec,
+                    "verdict": verdict,
+                    "output_file": out_name or None,
+                    "outbox_message_id": queued_mid,
+                    "utc": now_str,
+                },
+                indent=2,
             )
         )
     return 0
@@ -1552,6 +2408,54 @@ def cmd_post_directive(args: argparse.Namespace) -> int:
     return 0
 
 
+def get_review_hold_status(
+    wiki_dir: Path,
+    timeout_minutes: int = DEFAULT_REVIEW_TIMEOUT_MINUTES,
+    now: dt.datetime | None = None,
+) -> tuple[set[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (held_output_files, held_items, unreviewed_timeouts) from active board review state."""
+    ref_now = now or utc_now()
+    board_path = wiki_dir / board_filename(wiki_dir)
+    if not board_path.exists():
+        return set(), [], []
+    board_txt = board_path.read_text(encoding="utf-8")
+    rows = parse_tasks_table(board_txt)
+    active_review_ids = {
+        r["id"] for r in rows if r["status"] in ("NEEDS_REVIEW", "IN_REVIEW")
+    }
+    rev_state = load_board_review_state(board_txt)
+
+    held_files: set[str] = set()
+    held_items: list[dict[str, Any]] = []
+    timed_out: list[dict[str, Any]] = []
+
+    for tid in sorted(active_review_ids):
+        rmeta = rev_state.get(tid, {})
+        out_file = str(rmeta.get("output_file") or "").strip()
+        sub_dt = parse_iso_utc(str(rmeta.get("submitted_utc") or ""))
+        age_min = (
+            round((ref_now - sub_dt).total_seconds() / 60.0, 1)
+            if sub_dt is not None
+            else 0.0
+        )
+        entry = {
+            "task_id": tid,
+            "author": rmeta.get("author"),
+            "author_spec": rmeta.get("author_spec"),
+            "reviewer": rmeta.get("reviewer"),
+            "output_file": out_file or None,
+            "submitted_utc": rmeta.get("submitted_utc"),
+            "age_minutes": age_min,
+        }
+        if age_min >= timeout_minutes:
+            timed_out.append(entry)
+        else:
+            held_items.append(entry)
+            if out_file:
+                held_files.add(out_file)
+    return held_files, held_items, timed_out
+
+
 def cmd_notify_human(args: argparse.Namespace) -> int:
     wiki_dir: Path = args.wiki_dir
     outbox_path = wiki_dir / human_outbox_filename(wiki_dir)
@@ -1559,6 +2463,7 @@ def cmd_notify_human(args: argparse.Namespace) -> int:
         print(f"ERROR: Missing human outbox file: {outbox_path}", file=sys.stderr)
         return 1
 
+    fname = ""
     deliv_cell = "—"
     if args.file:
         fname = Path(args.file).name
@@ -1571,6 +2476,23 @@ def cmd_notify_human(args: argparse.Namespace) -> int:
         deliv_cell = f"[{fname}]({fname})"
 
     with FileLock(args.lock_file):
+        # If this deliverable is currently awaiting peer review, attach due/message to review metadata
+        # as well; spokesperson-check will hold the outbox row until complete-review or timeout.
+        held_until_reviewed = False
+        board_path = wiki_dir / board_filename(wiki_dir)
+        if fname and board_path.exists():
+            btxt = board_path.read_text(encoding="utf-8")
+            rstate = load_board_review_state(btxt)
+            for rmeta in rstate.values():
+                if rmeta.get("output_file") == fname:
+                    held_until_reviewed = True
+                    if args.due and not rmeta.get("due"):
+                        rmeta["due"] = args.due.strip()
+                    if args.message and not rmeta.get("message"):
+                        rmeta["message"] = args.message.strip()
+                    atomic_write(board_path, save_board_review_state(btxt, rstate))
+                    break
+
         text = outbox_path.read_text(encoding="utf-8")
         nums = [0] + [int(m.group(1)) for m in re.finditer(r"M-(\d{3,})", text)]
         mid = f"M-{max(nums) + 1:03d}"
@@ -1601,10 +2523,18 @@ def cmd_notify_human(args: argparse.Namespace) -> int:
                     "utc": now_str,
                     "kind": args.kind.lower().strip(),
                     "due": args.due,
+                    "held_until_reviewed": held_until_reviewed,
                 }
             )
         )
     return 0
+
+
+def _row_matches_held_files(row: dict[str, str], held_files: set[str]) -> bool:
+    if not held_files or row.get("kind") != "deliverable":
+        return False
+    deliv = row.get("deliverable", "")
+    return any(hf in deliv for hf in held_files)
 
 
 def cmd_spokesperson_check(args: argparse.Namespace) -> int:
@@ -1615,18 +2545,39 @@ def cmd_spokesperson_check(args: argparse.Namespace) -> int:
         return 1
 
     text = outbox_path.read_text(encoding="utf-8")
-    pending = parse_outbox_pending(text)
+    all_pending = parse_outbox_pending(text)
     state = load_outbox_state(text)
     seen: dict[str, dict[str, object]] = state.get("seen_outputs") or {}  # type: ignore[assignment]
     curr_outputs = compute_output_hashes(wiki_dir)
 
+    held_files, held_items, unreviewed_timeouts = get_review_hold_status(
+        wiki_dir, timeout_minutes=args.review_timeout_minutes
+    )
+    pending = [r for r in all_pending if not _row_matches_held_files(r, held_files)]
+
     new_outputs: list[str] = []
     modified_outputs: list[str] = []
     for fname, meta in curr_outputs.items():
+        if fname in held_files:
+            continue
         if fname not in seen:
             new_outputs.append(fname)
         elif seen[fname].get("sha256_16") != meta["sha256_16"]:
             modified_outputs.append(fname)
+
+    # If a deliverable is currently held for peer review and the ONLY modified output is the
+    # start-here digest index (with no unheld outbox items or new outputs), hold the index too
+    # so @runai reports both together once peer review finishes.
+    if (
+        held_files
+        and not pending
+        and not new_outputs
+        and modified_outputs
+        and all(fn.startswith("output--start-here-") for fn in modified_outputs)
+    ):
+        for fn in modified_outputs:
+            held_files.add(fn)
+        modified_outputs = []
 
     seen_gemini_alerts: set[str] = set(state.get("seen_gemini_alerts") or [])  # type: ignore[arg-type]
     watchdog = inspect_sb_watchdog(
@@ -1637,7 +2588,11 @@ def cmd_spokesperson_check(args: argparse.Namespace) -> int:
     ]
 
     anything = bool(
-        pending or new_outputs or modified_outputs or unseen_gemini_alerts
+        pending
+        or new_outputs
+        or modified_outputs
+        or unseen_gemini_alerts
+        or unreviewed_timeouts
     )
     print(
         json.dumps(
@@ -1648,6 +2603,8 @@ def cmd_spokesperson_check(args: argparse.Namespace) -> int:
                 "unsent_items": pending,
                 "new_outputs": new_outputs,
                 "modified_outputs": modified_outputs,
+                "held_for_review": held_items,
+                "unreviewed_timeouts": unreviewed_timeouts,
                 "gemini_watchdog_alerts": unseen_gemini_alerts,
             },
             indent=2,
@@ -1665,9 +2622,34 @@ def cmd_spokesperson_mark_sent(args: argparse.Namespace) -> int:
 
     with FileLock(args.lock_file):
         text = outbox_path.read_text(encoding="utf-8")
-        pending = parse_outbox_pending(text)
+        all_pending = parse_outbox_pending(text)
         state = load_outbox_state(text)
+        prev_seen: dict[str, dict[str, object]] = dict(state.get("seen_outputs") or {})  # type: ignore[arg-type]
         now_str = iso_utc()
+
+        held_files, _, _ = get_review_hold_status(
+            wiki_dir, timeout_minutes=args.review_timeout_minutes
+        )
+        delivered_pending = [
+            r for r in all_pending if not _row_matches_held_files(r, held_files)
+        ]
+        kept_pending = [
+            r for r in all_pending if _row_matches_held_files(r, held_files)
+        ]
+
+        curr_outputs = compute_output_hashes(wiki_dir)
+        next_seen: dict[str, dict[str, object]] = {}
+        for fname, meta in curr_outputs.items():
+            if fname in held_files or (
+                held_files
+                and not delivered_pending
+                and fname.startswith("output--start-here-")
+            ):
+                if fname in prev_seen:
+                    next_seen[fname] = prev_seen[fname]
+            else:
+                next_seen[fname] = meta
+
         watchdog = inspect_sb_watchdog(
             args.sb_cache_dir, lag_hours=args.gemini_lag_hours
         )
@@ -1677,7 +2659,7 @@ def cmd_spokesperson_mark_sent(args: argparse.Namespace) -> int:
 
         state["last_reported_utc"] = now_str
         state["spokesperson_agent"] = args.agent.lower().strip()
-        state["seen_outputs"] = compute_output_hashes(wiki_dir)
+        state["seen_outputs"] = next_seen
         state["seen_gemini_alerts"] = active_alert_keys
 
         fenced = "```json\n" + json.dumps(state, indent=2) + "\n```"
@@ -1688,7 +2670,7 @@ def cmd_spokesperson_mark_sent(args: argparse.Namespace) -> int:
             text,
             "<!-- OUTBOX_PENDING_START -->",
             "<!-- OUTBOX_PENDING_END -->",
-            format_outbox_pending([]),
+            format_outbox_pending(kept_pending),
         )
 
         sent_block = extract_between_markers(
@@ -1700,7 +2682,7 @@ def cmd_spokesperson_mark_sent(args: argparse.Namespace) -> int:
             if ln.strip() and not ln.strip().startswith("- *(Initial baseline")
         ]
         new_sent_entries: list[str] = []
-        for r in pending:
+        for r in delivered_pending:
             deliv_part = f" ({r['deliverable']})" if r["deliverable"] != "—" else ""
             new_sent_entries.append(
                 f"- **`{r['id']}`** (delivered {now_str} by `@{args.agent.lower()}`, from `@{r['agent']}`, `{r['kind']}`): {r['summary']}{deliv_part}"
@@ -1721,7 +2703,8 @@ def cmd_spokesperson_mark_sent(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "delivered_utc": now_str,
-                    "cleared_pending_count": len(pending),
+                    "cleared_pending_count": len(delivered_pending),
+                    "held_pending_count": len(kept_pending),
                     "tracked_outputs": len(state["seen_outputs"]),
                 }
             )
@@ -1755,6 +2738,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reg.add_argument("--name", help="Optional preferred lowercase single-word name.")
     reg.add_argument("--focus", help="Short summary of initial focus.")
+    reg.add_argument("--runtime", help="Agent runtime (e.g. antigravity, claude-code).")
+    reg.add_argument("--model", help="Declared model (e.g. gemini-4-carbon, gemini-4-argon, gemini-3.8-flash, sonnet, opus, gemini-unspecified).")
+    reg.add_argument("--effort", help="Declared effort level (e.g. 1.00, 0.50, low, medium, high, xhigh, max).")
+
+    sam = sub.add_parser(
+        "set-agent-meta",
+        help="Update declared runtime, model, effort, and computed capability tier on an agent card.",
+    )
+    sam.add_argument("--agent", required=True, help="Registered agent name.")
+    sam.add_argument("--runtime", help="Agent runtime (e.g. antigravity, claude-code).")
+    sam.add_argument("--model", help="Declared model name.")
+    sam.add_argument("--effort", help="Declared effort level.")
+    sam.add_argument("--touch-heartbeat", action="store_true", help="Also advance Last Heartbeat (UTC).")
 
     rc = sub.add_parser(
         "random-cron",
@@ -1779,9 +2775,12 @@ def build_parser() -> argparse.ArgumentParser:
     hb.add_argument(
         "--status",
         default="active",
-        choices=["active", "coordinating", "working", "idle"],
+        choices=["active", "coordinating", "working", "reviewing", "idle"],
     )
     hb.add_argument("--focus", help="Updated summary of current focus (renames presence file).")
+    hb.add_argument("--runtime", help="Optional runtime update.")
+    hb.add_argument("--model", help="Optional model update.")
+    hb.add_argument("--effort", help="Optional effort update.")
 
     ren = sub.add_parser(
         "rename", help="Rename a wiki file when its summary changes and rewrite incoming links."
@@ -1840,12 +2839,48 @@ def build_parser() -> argparse.ArgumentParser:
     ct.add_argument("--stale-minutes", type=int, default=120)
 
     dt_cmd = sub.add_parser(
-        "complete-task", help="Mark a claimed task DONE and link its output--*.md file."
+        "complete-task",
+        help="Submit a claimed task for peer verification (NEEDS_REVIEW) and link its output--*.md file.",
     )
     dt_cmd.add_argument("--agent", required=True)
     dt_cmd.add_argument("--task-id", required=True)
     dt_cmd.add_argument("--output-file", help="Filename of output--*.md deliverable in wiki.")
-    dt_cmd.add_argument("--notes", help="Optional completion note.")
+    dt_cmd.add_argument("--due", help="Optional YYYY-MM-DD deadline for human outbox notification once reviewed.")
+    dt_cmd.add_argument("--message", help="Concise 1-2 line summary for @runai once peer-reviewed.")
+    dt_cmd.add_argument("--notes", help="Optional author handoff / completion note.")
+    dt_cmd.add_argument(
+        "--skip-review",
+        action="store_true",
+        help="Bypass peer verification (admin/trivial bookkeeping only).",
+    )
+
+    cr_cmd = sub.add_parser(
+        "claim-review",
+        help="Atomically claim a NEEDS_REVIEW task as a distinct peer reviewer (tier >= max(2, author_tier)).",
+    )
+    cr_cmd.add_argument("--agent", required=True, help="Peer reviewer agent name (must differ from author).")
+    cr_cmd.add_argument("--task-id", required=True, help="Task ID such as T-043.")
+    cr_cmd.add_argument("--stale-minutes", type=int, default=120)
+    cr_cmd.add_argument("--force", action="store_true", help="Override capability tier floor if needed.")
+
+    cv_cmd = sub.add_parser(
+        "complete-review",
+        help="Mark a peer-reviewed task DONE, stamp provenance on output--*.md, and release notification to @runai.",
+    )
+    cv_cmd.add_argument("--agent", required=True, help="Peer reviewer agent name.")
+    cv_cmd.add_argument("--task-id", required=True)
+    cv_cmd.add_argument(
+        "--verdict",
+        default="verified",
+        choices=["verified", "corrected"],
+        help="Whether the deliverable was verified as-is or corrected in place before approval.",
+    )
+    cv_cmd.add_argument("--notes", required=True, help="What sources/tests were checked and any corrections made.")
+    cv_cmd.add_argument("--output-file", help="Optional updated output--*.md filename if renamed.")
+    cv_cmd.add_argument("--due", help="Optional YYYY-MM-DD due date override for human-outbox.")
+    cv_cmd.add_argument("--message", help="Optional 1-2 line human summary override for human-outbox.")
+    cv_cmd.add_argument("--no-notify", action="store_true", help="Do not queue an outbox message.")
+    cv_cmd.add_argument("--force", action="store_true", help="Override capability tier floor if needed.")
 
     pd_cmd = sub.add_parser(
         "post-directive",
@@ -1880,6 +2915,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_GEMINI_LAG_HOURS,
         help=f"Lag threshold in hours for Gemini-synced sources (default: {DEFAULT_GEMINI_LAG_HOURS:g}).",
     )
+    spc_cmd.add_argument(
+        "--review-timeout-minutes",
+        type=int,
+        default=DEFAULT_REVIEW_TIMEOUT_MINUTES,
+        help=f"Minutes to hold NEEDS_REVIEW deliverables before surfacing unreviewed (default: {DEFAULT_REVIEW_TIMEOUT_MINUTES}).",
+    )
 
     sms_cmd = sub.add_parser(
         "spokesperson-mark-sent",
@@ -1894,6 +2935,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_GEMINI_LAG_HOURS,
         help=f"Lag threshold in hours for Gemini-synced sources (default: {DEFAULT_GEMINI_LAG_HOURS:g}).",
     )
+    sms_cmd.add_argument(
+        "--review-timeout-minutes",
+        type=int,
+        default=DEFAULT_REVIEW_TIMEOUT_MINUTES,
+        help=f"Minutes to hold NEEDS_REVIEW deliverables before marking seen (default: {DEFAULT_REVIEW_TIMEOUT_MINUTES}).",
+    )
 
     return p
 
@@ -1905,6 +2952,7 @@ def main() -> int:
         "index": cmd_index,
         "validate": cmd_validate,
         "register-agent": cmd_register_agent,
+        "set-agent-meta": cmd_set_agent_meta,
         "random-cron": cmd_random_cron,
         "quick-check": cmd_quick_check,
         "heartbeat": cmd_heartbeat,
@@ -1915,6 +2963,8 @@ def main() -> int:
         "add-task": cmd_add_task,
         "claim-task": cmd_claim_task,
         "complete-task": cmd_complete_task,
+        "claim-review": cmd_claim_review,
+        "complete-review": cmd_complete_review,
         "post-directive": cmd_post_directive,
         "notify-human": cmd_notify_human,
         "spokesperson-check": cmd_spokesperson_check,

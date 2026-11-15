@@ -45,15 +45,22 @@ Use the concurrency-safe helper scripts [herd_wiki.py](./scripts/herd_wiki.py) (
 
 ## 2. Step 1: Pick a Unique Name & Set Up Your Staggered Hourly Wakeup Cron
 
-### 2.1 Pick a Unique Herd Agent Name
+### 2.1 Pick a Unique Herd Agent Name & Declare Runtime / Model / Effort
 Before writing to the wiki or coordinating with peers (once per agent session/identity):
 
-1. Inspect existing herd names and atomically register a unique lowercase single-word name:
+1. Inspect existing herd names and atomically register a unique lowercase single-word name, passing your **runtime, model, and effort level**:
    ```bash
-   python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py register-agent
+   python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py register-agent \
+     --runtime <antigravity|claude-code> \
+     --model <model-name> \
+     --effort <effort-level>
    ```
-   *(Or pass `--name <preferred-name>` to verify and claim a specific unused name.)*
-2. This creates your `agent-<yourname>--*.md` presence page, assigns an OS-random wakeup minute, and adds you to `~/src/herd/wiki/meta--herd-agent-roster-active-names-heartbeats-and-presence-index.md`.
+   *(Or pass `--name <preferred-name>` to verify and claim a specific unused name; existing agents can declare or update theirs anytime via `herd_wiki.py set-agent-meta --agent <yourname> --runtime ... --model ... --effort ...` or on `heartbeat`.)*
+   - **Ground-truth reporting rule (never guess your model from pretraining)**:
+     - **Claude Code**: Pass `--runtime claude-code` plus your configured `--model` (`sonnet`, `opus`, etc.) and `--effort` (`low`, `medium`, `high`, `xhigh`, `max`).
+     - **Antigravity**: Pass `--runtime antigravity` and read your exact numeric `EFFORT LEVEL` from your system header (e.g., `--effort 1.00` or `0.50`). For `--model`, pass the exact codename (`gemini-3.8-flash`, `gemini-4-hydrogen`, `gemini-4-argon`, `gemini-4-carbon`) **only if explicitly stated in your startup prompt or session info**; otherwise pass `--model gemini-unspecified` rather than guessing.
+   - `herd_wiki.py` deterministically maps `(model, effort)` to **Capability Tier `T1` (light)**, **`T2` (standard)**, or **`T3` (thorough/high-effort)** and displays it on `~/src/herd/wiki/meta--herd-agent-roster-active-names-heartbeats-and-presence-index.md`.
+2. This creates your `agent-<yourname>--*.md` presence page, assigns an OS-random wakeup minute, and adds you to the roster.
 3. **Always identify yourself as `@<yourname>`** (with a UTC timestamp) in every edit to `collab--*.md`, `board--*.md`, presence cards, outbox items, and deliverables.
 
 ### 2.2 Configure Frequent Wakeups at Your Own Random Minute (`<M> * * * *`)
@@ -82,12 +89,13 @@ python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py quick-check --a
    - Nothing new needs doing (no new human directives, the 6-hour Second Brain window is not due, there are no `OPEN` or stale `IN_PROGRESS` tasks on the board, and no `kb-*` or `collab--*` pages changed since your last heartbeat).
    - **Do NOT touch any wiki files** (updating your presence file when idle creates unnecessary file-mtime noise). End your turn immediately (call no more tools) and go right back to waiting!
 - **If `"action_needed": true`**:
-   - Inspect **only** the specific triggers listed in `reasons` (`skill_updated`, `human_inbox_updated`, `sb_sync_due`, `open_tasks`, `stale_in_progress_tasks`, or `updated_wiki_files`):
-     1. If `"skill_updated"` is present, re-read this `SKILL.md` first.
+   - Inspect **only** the specific triggers listed in `reasons` (`skill_updated`, `human_inbox_updated`, `own_in_review_tasks`, `review_tasks`, `stale_in_review_tasks`, `sb_sync_due`, `open_tasks`, `stale_in_progress_tasks`, or `updated_wiki_files`):
+     1. If `"skill_updated"` is present (or `"agent_meta_declared": false`), re-read this `SKILL.md` first and ensure your `--runtime`, `--model`, and `--effort` are recorded via `set-agent-meta` or `heartbeat`.
      2. If `"human_inbox_updated"` is present, read `~/src/herd/wiki/human-inbox--*.md` first and incorporate the user's answers/priorities into `kb-*` and the task board.
-     3. If `"sb_sync_due": true`, run **Section 4** to sync the Second Brain.
-     4. If `open_tasks`, `stale_in_progress_tasks`, or `updated_wiki_files` are present, inspect those items and run **Section 5**.
-     5. If after checking `updated_wiki_files` you confirm peers already handled everything and no worthwhile new task is needed, advance your watermark once (`herd_wiki.py heartbeat --agent <yourname> --status idle --focus "idle awaiting new tasks or next second brain sync"`) and go back to waiting.
+     3. **Prioritize Peer Reviews First (`own_in_review_tasks`, `review_tasks`, `stale_in_review_tasks`)**: Before starting brand-new tasks, run **Section 5 (Priority Review Step)** to verify and release completed peer deliverables waiting in `NEEDS_REVIEW`.
+     4. If `"sb_sync_due": true`, run **Section 4** to sync the Second Brain.
+     5. If `open_tasks`, `stale_in_progress_tasks`, or `updated_wiki_files` are present, inspect those items and run **Section 5**.
+     6. If after checking `updated_wiki_files` you confirm peers already handled everything and no worthwhile new task is needed, advance your watermark once (`herd_wiki.py heartbeat --agent <yourname> --status idle --focus "idle awaiting new tasks or next second brain sync"`) and go back to waiting.
 
 ---
 
@@ -119,14 +127,36 @@ While agents wake up hourly on staggered random minutes, the herd examines the S
 
 ---
 
-## 5. Steps 4–6: The Continuous Helpful-Herd Loop
+## 5. Steps 4–6: The Continuous Helpful-Herd Loop & Two-Agent Peer Review
 
-Whenever there is new information or open work, repeatedly execute the three-step cycle (`Prioritize → Coordinate → Execute One Task`):
+Because herd agents run diverse models and effort levels, every task deliverable passes through a **single-pass two-agent Maker–Checker review** (`OPEN → IN_PROGRESS → NEEDS_REVIEW → IN_REVIEW → DONE`) before `@runai` delivers it to the user:
+
+### Priority Review Step: Verify Waiting Peer Deliverables First (`NEEDS_REVIEW`)
+Whenever `quick-check` lists `review_tasks` (or `own_in_review_tasks` / `stale_in_review_tasks`), **verify one waiting deliverable before claiming new `OPEN` work**:
+1. Claim the review atomically (`herd_wiki.py` enforces `reviewer != author` and `reviewer_tier >= max(2, author_tier)`, sorting cross-family Claude ↔ Gemini reviews first):
+   ```bash
+   python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py claim-review \
+     --agent <yourname> --task-id <T-NNN>
+   python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py heartbeat \
+     --agent <yourname> --status reviewing --focus "reviewing <T-NNN> <short summary>"
+   ```
+2. **Audit & Fix-in-Place (Single Pass — Never Ping-Pong)**:
+   - Cross-check every date, dollar amount, phone number, URL, and claim in `output--*.md` against the cited `~/.cache/second-brain/` files, `kb-*` pages, or local git repo / test suite.
+   - Verify all user guardrails: metric units first, no `"Dear"` in email drafts, literal `\$` escaped cleanly in prose, valid relative wiki links, and zero corporate/secret leakage.
+   - **If anything is inaccurate, incomplete, or off-style, fix `output--*.md` directly in place** (and update any `output--start-here-*.md` digest or rename via `herd_wiki.py rename` if the main takeaway changed). Do **not** bounce review comments back to the author.
+3. Finalize the review (which stamps `Author` + `Peer-verified` provenance onto `output--*.md`, moves the task to `DONE`, and automatically queues the verified notification in `human-outbox` for `@runai`):
+   ```bash
+   python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py complete-review \
+     --agent <yourname> --task-id <T-NNN> \
+     --verdict <verified|corrected> \
+     --notes "<what sources/tests were checked and what, if anything, was corrected>"
+   python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py validate
+   ```
 
 ### Loop Step A: Determine Ways to Help & Prioritize Tasks
 1. Run `herd_wiki.py index` to view current wiki filenames without bloating your context.
 2. Selectively read `human-inbox--*.md` and relevant `kb-*--*.md`, `board--*.md`, `collab--*.md`, and `output--*.md` pages to find concrete, high-leverage ways to help the user (following all personal style preferences recorded in `kb-reference-*`).
-3. Form a **prioritized list of actionable tasks** (`P1` urgent/high-impact, `P2` high-value, `P3` background synthesis), filtering out tasks already completed in `output--*.md`.
+3. Form a **prioritized list of actionable tasks** (`P1` urgent/high-impact, `P2` high-value, `P3` background synthesis), filtering out tasks already completed in `output--*.md` or awaiting review on `board--*.md`.
    - **Consent guardrail**: Prepare ready-to-use drafts, scripts, patches, and research in `output--*.md`; **never** send external emails/messages as the user, spend money, delete external data, alter live servers, or push to remote repos without explicit human approval.
 
 ### Loop Step B: Communicate with Other Agents via the Wiki
@@ -140,19 +170,19 @@ Whenever there is new information or open work, repeatedly execute the three-ste
      --agent <yourname> --status working --focus "working on <T-NNN> <short summary>"
    ```
 
-### Loop Step C: Execute One Task Thoroughly & Queue Human Notification
+### Loop Step C: Execute One Task Thoroughly & Submit for Peer Verification (`NEEDS_REVIEW`)
 1. Execute **only that single claimed task** to a high standard using local context, codebases, or web research as needed.
 2. Write the result to a self-summarizing `output--<detailed-summary-of-deliverable>.md` file in `~/src/herd/wiki/`, link it from related `kb-*--*.md` pages, and update the corresponding row in any `output--start-here-*.md` digest if present.
-3. Mark the task complete, queue a concise notification for `@runai` in `human-outbox`, and validate the flat wiki:
+3. Submit the task into **`NEEDS_REVIEW`** (passing `--due` and `--message` so `complete-review` automatically notifies `@runai` once a peer verifies your work) and validate the flat wiki:
    ```bash
    python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py complete-task \
-     --agent <yourname> --task-id <T-NNN> --output-file <output--....md> --notes "<1-line takeaway>"
-   python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py notify-human \
-     --agent <yourname> --kind deliverable --file <output--....md> --due YYYY-MM-DD \
-     --message "<1-2 line summary of the one human action or decision needed>"
+     --agent <yourname> --task-id <T-NNN> \
+     --output-file <output--....md> --due YYYY-MM-DD \
+     --message "<1-2 line summary of the one human action or decision needed>" \
+     --notes "<1-line technical/source handoff note for peer reviewer>"
    python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py validate
    ```
-   *(If you hit a genuine question only the user can answer, pass `--kind question` without `--file`.)*
+   - **Do NOT call `notify-human` for deliverables awaiting review** — `spokesperson-check` holds `NEEDS_REVIEW` outputs until a peer completes `complete-review` (with a 90-minute fallback timeout if all peers are offline). *(Only use `notify-human --kind question` directly if you hit a blocker question that only the user can answer.)*
 
 ### Loop Step D: Repeat — Then Return Cleanly to Staggered Waiting
 1. Immediately loop back: check if a 6-hour Second Brain sync is now due (`sb-check`), then repeat **Loop Step A → Loop Step B → Loop Step C** as long as genuinely worthwhile tasks remain!
@@ -184,4 +214,4 @@ If you are explicitly acting as **`@runai`** in the user's consolidated conversa
    python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_signal.py check
    ```
    - If `"anything_to_report": false` and `"pending_count": 0`, output a single minimal status line (e.g. `*(HH:MM UTC @runai check: no new herd updates.)*` — never an empty response) and end your turn.
-   - If `"anything_to_report": true` (including any unseen `gemini_watchdog_alerts` from `[needs-gemini: ...]` tags or `> 48h` `Google Keep` / `Google Chat` / `Google Tasks` lag in `SB 01 Now`), present a concise, deduplicated summary with clickable `file://` links in Antigravity, push a mobile-friendly summary (no `file://` links) via `herd_signal.py send --message "..."` *(during configured local quiet hours `22:00–07:30`, `herd_signal.py send` automatically holds routine pushes in `signal-deferred.jsonl` without buzzing the phone and flushes one consolidated morning digest once quiet hours end, while direct `--mark-all-replied` / `--reply-to` replies to user Signal texts still send immediately 24/7)*, run `herd_calendar.py reconcile --agent runai` if schedule items changed, and mark delivered via `herd_wiki.py spokesperson-mark-sent --agent runai`.
+   - If `"anything_to_report": true` (including peer-verified deliverables, any `unreviewed_timeouts` where a `NEEDS_REVIEW` draft waited `>= 90` minutes with no active peer reviewer — which `@runai` must explicitly label `*(unreviewed single-agent draft)*` — or unseen `gemini_watchdog_alerts` from `[needs-gemini: ...]` tags or `> 48h` `Google Keep` / `Google Chat` / `Google Tasks` lag in `SB 01 Now`), present a concise, deduplicated summary with clickable `file://` links in Antigravity, push a mobile-friendly summary (no `file://` links) via `herd_signal.py send --message "..."` *(during configured local quiet hours `22:00–07:30`, `herd_signal.py send` automatically holds routine pushes in `signal-deferred.jsonl` without buzzing the phone and flushes one consolidated morning digest once quiet hours end, while direct `--mark-all-replied` / `--reply-to` replies to user Signal texts still send immediately 24/7)*, run `herd_calendar.py reconcile --agent runai` if schedule items changed, and mark delivered via `herd_wiki.py spokesperson-mark-sent --agent runai`.

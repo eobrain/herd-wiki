@@ -151,27 +151,35 @@ def build_allowed_tools(herd_dir: Path) -> list[str]:
     return rules
 
 
-def build_tick_prompt(agent: str, qc: dict) -> str:
+def build_tick_prompt(agent: str, qc: dict, cfg: dict) -> str:
     qc_json = json.dumps(qc, indent=2)
+    model = cfg.get("model", "sonnet")
+    effort = cfg.get("effort", "high")
     return (
-        f"You are `@{agent}` (a Claude Code worker agent in the Herd), woken by "
+        f"You are `@{agent}` (a Claude Code worker agent in the Herd running `claude-code:{model}@{effort}`), woken by "
         f"`herd_claude_worker.py tick` because `quick-check` reported `action_needed: true`.\n\n"
-        f" Note: `systemd --user` manages your staggered hourly wakeup timer — do NOT call "
+        f"Note: `systemd --user` manages your staggered hourly wakeup timer — do NOT call "
         f"`CronCreate` or loop indefinitely.\n\n"
         f"Here is your current `quick-check` JSON:\n"
         f"```json\n{qc_json}\n```\n\n"
         f"Follow the `herd-wiki` skill (`.claude/skills/herd-wiki/SKILL.md`) and `CLAUDE.md`:\n"
         f"1. Read ONLY the wiki / Second Brain files relevant to `reasons` above (use "
         f"`herd_wiki.py index` first; never read all wiki files upfront).\n"
-        f"2. If `sb_sync_due` is true, claim & run the Second Brain sync (`sb-check --agent {agent} --claim` "
-        f"-> update focused `kb-*--*.md` pages -> `sb-complete`).\n"
-        f"3. Coordinate with peer agents on `board--*.md` and `collab--*.md` (signing as `@{agent}`). "
+        f"2. **Priority #1 — Peer Review (`own_in_review_tasks` / `review_tasks` / `stale_in_review_tasks`)**: "
+        f"If any peer deliverable awaits verification, claim ONE review (`herd_wiki.py claim-review --agent {agent} --task-id <T-NNN>`), "
+        f"cross-check every date, number, link, test result, and style/privacy rule against Second Brain or the repo, "
+        f"edit `output--*.md` directly in place if corrections are needed (renaming via `herd_wiki.py rename` if the takeaway changed), "
+        f"and finalize via `herd_wiki.py complete-review --agent {agent} --task-id <T-NNN> --verdict <verified|corrected> --notes \"...\"`.\n"
+        f"3. **Priority #2 — Second Brain Sync**: If `sb_sync_due` is true, claim & run the Second Brain sync "
+        f"(`sb-check --agent {agent} --claim` -> update focused `kb-*--*.md` pages -> `sb-complete`).\n"
+        f"4. **Priority #3 — Authoring Open Tasks**: Coordinate with peer agents on `board--*.md` and `collab--*.md` (signing as `@{agent}`). "
         f"If genuinely worthwhile `OPEN` tasks exist (or `human_inbox_updated` / Second Brain changes warrant "
-        f"a new high-leverage task), claim and execute ONE task thoroughly to an `output--*.md` file, "
-        f"mark it complete (`complete-task`), and queue a concise notification for `@runai` via `notify-human`.\n"
-        f"4. If peers already handled the `updated_wiki_files` and no worthwhile task remains, do NOT invent filler work.\n"
-        f"5. Before ending your turn, update your idle watermark via:\n"
-        f"   `python3 {HERD_WIKI_PY} heartbeat --agent {agent} --status idle --focus \"idle awaiting new tasks or next second brain sync\"`\n"
+        f"a new high-leverage task), claim and execute ONE task thoroughly to an `output--*.md` file and submit it for peer verification via "
+        f"`herd_wiki.py complete-task --agent {agent} --task-id <T-NNN> --output-file <output--....md> --due YYYY-MM-DD --message \"<1-2 line summary for @runai>\" --notes \"...\"` "
+        f"(do NOT call `notify-human` prematurely — a peer reviewer will verify and release it to `@runai`).\n"
+        f"5. If peers already handled the `updated_wiki_files` and no worthwhile task remains, do NOT invent filler work.\n"
+        f"6. Before ending your turn, update your idle watermark via:\n"
+        f"   `python3 {HERD_WIKI_PY} heartbeat --agent {agent} --status idle --runtime claude-code --model {model} --effort {effort} --focus \"idle awaiting new tasks or next second brain sync\"`\n"
         f"   and run `python3 {HERD_WIKI_PY} validate`."
     )
 
@@ -191,14 +199,39 @@ def cmd_install(args: argparse.Namespace) -> int:
             "Omit --agent (or choose a worker name) for Claude Herd workers."
         )
 
+    model_name = args.model.strip()
+    effort_level = args.effort.strip().lower()
+
     # Register new agent or reuse existing registered worker
     agent_cards = sorted(wiki_dir.glob(f"agent-{preferred}--*.md")) if preferred else []
     if preferred and agent_cards:
         rc = run_wiki_cmd("random-cron", "--agent", preferred, wiki_dir=wiki_dir)
+        run_wiki_cmd(
+            "set-agent-meta",
+            "--agent",
+            preferred,
+            "--runtime",
+            "claude-code",
+            "--model",
+            model_name,
+            "--effort",
+            effort_level,
+            wiki_dir=wiki_dir,
+        )
         agent = preferred
         minute = int(rc["wakeup_minute"])
     else:
-        reg_args = ["register-agent", "--focus", "claude-worker-idle-awaiting-tasks-or-second-brain-sync"]
+        reg_args = [
+            "register-agent",
+            "--runtime",
+            "claude-code",
+            "--model",
+            model_name,
+            "--effort",
+            effort_level,
+            "--focus",
+            "claude-worker-idle-awaiting-tasks-or-second-brain-sync",
+        ]
         if preferred:
             reg_args.extend(["--name", preferred])
         reg = run_wiki_cmd(*reg_args, wiki_dir=wiki_dir)
@@ -216,7 +249,8 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     cfg = {
         "agent": agent,
-        "model": args.model.strip(),
+        "model": model_name,
+        "effort": effort_level,
         "wakeup_minute": minute,
         "herd_dir": str(herd_dir),
         "sb_cache_dir": str(args.sb_cache_dir.expanduser().resolve()),
@@ -261,7 +295,10 @@ WantedBy=timers.target
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "--user", "enable", "--now", tmr_name], check=True)
-    append_log(agent, f"Installed systemd timer {tmr_name} (minute={minute:02d}, model={cfg['model']})")
+    append_log(
+        agent,
+        f"Installed systemd timer {tmr_name} (minute={minute:02d}, model={cfg['model']}, effort={cfg['effort']})",
+    )
 
     print(
         json.dumps(
@@ -269,6 +306,7 @@ WantedBy=timers.target
                 "ok": True,
                 "agent": agent,
                 "model": cfg["model"],
+                "effort": cfg["effort"],
                 "wakeup_minute": minute,
                 "on_calendar": f"*-*-* *:{minute:02d}:00",
                 "timer_unit": tmr_name,
@@ -317,14 +355,18 @@ def cmd_tick(args: argparse.Namespace) -> int:
             )
             return 0
 
-        prompt = build_tick_prompt(agent, qc_before)
+        prompt = build_tick_prompt(agent, qc_before, cfg)
         allowed_tools = build_allowed_tools(herd_dir)
+        model_val = cfg.get("model", "sonnet")
+        effort_val = cfg.get("effort", "high")
         cmd = [
             str(CLAUDE_BIN),
             "-p",
             prompt,
             "--model",
-            cfg.get("model", "sonnet"),
+            model_val,
+            "--effort",
+            effort_val,
             "--permission-mode",
             "acceptEdits",
             "--permission-prompts",
@@ -346,7 +388,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                         "dry_run": True,
                         "action_needed": action_needed,
                         "reasons": qc_before.get("reasons", []),
-                        "claude_cmd_preview": cmd[:10] + ["..."],
+                        "claude_cmd_preview": cmd[:12] + ["..."],
                     },
                     indent=2,
                 )
@@ -354,7 +396,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
             return 0
 
         reasons_str = ",".join(qc_before.get("reasons", [])) or ("forced" if args.force else "unknown")
-        append_log(agent, f"waking Claude ({cfg.get('model', 'sonnet')}) for reasons=[{reasons_str}]")
+        append_log(agent, f"waking Claude ({model_val}@{effort_val}) for reasons=[{reasons_str}]")
 
         proc = subprocess.run(
             cmd,
@@ -381,16 +423,26 @@ def cmd_tick(args: argparse.Namespace) -> int:
             )
             return proc.returncode
 
-        # Safety watermark post-hook: ensure idle heartbeat advances if Claude left no IN_PROGRESS task
+        # Safety watermark post-hook: ensure idle heartbeat advances if Claude left no IN_PROGRESS / IN_REVIEW task
         qc_after = run_wiki_cmd("quick-check", "--agent", agent, wiki_dir=wiki_dir)
         hb_advanced = qc_after.get("last_heartbeat_utc") != qc_before.get("last_heartbeat_utc")
-        if not hb_advanced and not qc_after.get("own_in_progress_tasks"):
+        if (
+            not hb_advanced
+            and not qc_after.get("own_in_progress_tasks")
+            and not qc_after.get("own_in_review_tasks")
+        ):
             run_wiki_cmd(
                 "heartbeat",
                 "--agent",
                 agent,
                 "--status",
                 "idle",
+                "--runtime",
+                "claude-code",
+                "--model",
+                model_val,
+                "--effort",
+                effort_val,
                 "--focus",
                 "idle awaiting new tasks or next second brain sync",
                 wiki_dir=wiki_dir,
@@ -436,6 +488,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
                 {
                     "agent": agent,
                     "model": cfg.get("model"),
+                    "effort": cfg.get("effort", "high"),
                     "wakeup_minute": cfg.get("wakeup_minute"),
                     "timer_unit": tmr_name,
                     "timer_state": active_proc.stdout.strip() or "inactive",
@@ -470,6 +523,12 @@ def build_parser() -> argparse.ArgumentParser:
     s_ins = sub.add_parser("install", help="Register a Claude Herd worker and enable its hourly systemd timer.")
     s_ins.add_argument("--agent", help="Optional preferred lowercase herd agent name (never 'runai')")
     s_ins.add_argument("--model", default="sonnet", help="Claude model alias/name (default: sonnet)")
+    s_ins.add_argument(
+        "--effort",
+        default="high",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help="Claude effort level (default: high)",
+    )
     s_ins.add_argument("--herd-dir", type=Path, default=DEFAULT_HERD_DIR)
     s_ins.add_argument("--sb-cache-dir", type=Path, default=DEFAULT_SB_CACHE_DIR)
     s_ins.set_defaults(func=cmd_install)
