@@ -10,7 +10,11 @@ Security invariants:
      before ever reaching the wiki or any LLM context.
   3. Hardcoded Outbound Recipient: `send` has no recipient CLI flag; it can only
      ever message `allowed_user_number` from `~/.config/herd/signal.json`.
-  4. Zero Identifiers in Wiki: Phone numbers and UUIDs live strictly in `0600`
+  4. Local Quiet Hours (`22:00–07:30` in configured IANA timezone by default):
+     Autonomous pushes during quiet hours are held in `signal-deferred.jsonl` (`0600`)
+     and consolidated into a single morning message once quiet hours end, while direct
+     replies to inbound user Signal messages still send immediately 24/7.
+  5. Zero Identifiers in Wiki: Phone numbers and UUIDs live strictly in `0600`
      files under `~/.config/herd/` and `~/.local/state/herd/`.
 """
 
@@ -29,6 +33,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 SIGNAL_CLI = Path(
     os.environ.get("SIGNAL_CLI_BIN")
@@ -44,11 +49,17 @@ STATE_DIR = Path(
 )
 SOCKET_PATH = STATE_DIR / "signal-rpc.sock"
 INBOX_JSONL = STATE_DIR / "signal-inbox.jsonl"
+DEFERRED_JSONL = STATE_DIR / "signal-deferred.jsonl"
 DROPPED_LOG = STATE_DIR / "signal-dropped.log"
 STATE_LOCK = STATE_DIR / "signal-state.lock"
 SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
 
+DEFAULT_QUIET_START = "22:00"
+DEFAULT_QUIET_END = "07:30"
+DEFAULT_TIMEZONE = "UTC"
+
 E164_RE = re.compile(r"^\+[1-9][0-9]{6,14}$")
+HHMM_RE = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
 
 
 def utc_iso() -> str:
@@ -158,6 +169,133 @@ def save_inbox(items: list[dict]) -> None:
     tmp.replace(INBOX_JSONL)
 
 
+def load_deferred() -> list[dict]:
+    if not DEFERRED_JSONL.exists():
+        return []
+    items: list[dict] = []
+    for line in DEFERRED_JSONL.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            items.append(json.loads(line))
+    return items
+
+
+def save_deferred(items: list[dict]) -> None:
+    ensure_state_dir()
+    tmp = DEFERRED_JSONL.with_suffix(".tmp")
+    body = "".join(json.dumps(it, ensure_ascii=False) + "\n" for it in items)
+    tmp.write_text(body, encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(DEFERRED_JSONL)
+
+
+def parse_hhmm(val: str) -> tuple[int, int]:
+    m = HHMM_RE.match(val.strip())
+    if not m:
+        raise SystemExit(f"Invalid time '{val}': expected 24-hour HH:MM (e.g. 22:00 or 07:30), or 'off'.")
+    return int(m.group(1)), int(m.group(2))
+
+
+def evaluate_quiet_hours(cfg: dict, now_utc: dt.datetime | None = None) -> dict:
+    now_dt = now_utc or dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    tz_name = (cfg.get("timezone") or os.environ.get("HERD_SIGNAL_TZ") or DEFAULT_TIMEZONE).strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception as exc:
+        raise SystemExit(f"Invalid IANA timezone '{tz_name}': {exc}") from exc
+
+    local_dt = now_dt.astimezone(tz)
+    raw_start = cfg.get("quiet_hours_start")
+    raw_end = cfg.get("quiet_hours_end")
+    q_start = (DEFAULT_QUIET_START if raw_start is None else str(raw_start)).strip()
+    q_end = (DEFAULT_QUIET_END if raw_end is None else str(raw_end)).strip()
+
+    if not q_start or not q_end or q_start.lower() in {"off", "none", "disabled"} or q_end.lower() in {"off", "none", "disabled"}:
+        return {
+            "enabled": False,
+            "active": False,
+            "timezone": tz_name,
+            "window": "off",
+            "local_time": local_dt.isoformat(timespec="seconds"),
+            "deliver_after_local": None,
+        }
+
+    sh, sm = parse_hhmm(q_start)
+    eh, em = parse_hhmm(q_end)
+    start_min = sh * 60 + sm
+    end_min = eh * 60 + em
+    cur_min = local_dt.hour * 60 + local_dt.minute
+
+    if start_min == end_min:
+        active = False
+        deliver_after = None
+    elif start_min > end_min:
+        active = (cur_min >= start_min) or (cur_min < end_min)
+        if active:
+            end_date = local_dt.date() + dt.timedelta(days=1) if cur_min >= start_min else local_dt.date()
+            deliver_after = dt.datetime(end_date.year, end_date.month, end_date.day, eh, em, 0, tzinfo=tz).isoformat(timespec="seconds")
+        else:
+            deliver_after = None
+    else:
+        active = start_min <= cur_min < end_min
+        deliver_after = (
+            dt.datetime(local_dt.year, local_dt.month, local_dt.day, eh, em, 0, tzinfo=tz).isoformat(timespec="seconds")
+            if active
+            else None
+        )
+
+    return {
+        "enabled": True,
+        "active": active,
+        "timezone": tz_name,
+        "window": f"{q_start}-{q_end}",
+        "local_time": local_dt.isoformat(timespec="seconds"),
+        "deliver_after_local": deliver_after,
+    }
+
+
+def deliver_raw_signal(cfg: dict, text: str) -> int | None:
+    if SOCKET_PATH.exists():
+        res = rpc_call("send", {"recipient": [cfg["allowed_user_number"]], "message": text}, timeout=25.0)
+        return res.get("timestamp")
+    proc = subprocess.run(
+        [str(SIGNAL_CLI), "--scrub-log", "-a", cfg["bot_number"], "send", "-m", text, cfg["allowed_user_number"]],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(f"signal-cli send failed: {proc.stderr or proc.stdout}")
+    return int(time.time() * 1000)
+
+
+def flush_deferred_messages(cfg: dict, force: bool = False, now_utc: dt.datetime | None = None) -> dict:
+    with state_lock():
+        qh = evaluate_quiet_hours(cfg, now_utc=now_utc)
+        deferred = load_deferred()
+        unsent = [d for d in deferred if not d.get("sent")]
+        if not unsent:
+            return {"flushed_count": 0, "quiet_hours": qh, "remaining_deferred": 0}
+        if qh["active"] and not force:
+            return {"flushed_count": 0, "quiet_hours": qh, "remaining_deferred": len(unsent)}
+
+        unique_texts = list(dict.fromkeys(d["text"] for d in unsent if d.get("text")))
+        combined = unique_texts[0] if len(unique_texts) == 1 else "\n\n---\n\n".join(unique_texts)
+        sent_ts = deliver_raw_signal(cfg, combined)
+        now_s = utc_iso()
+        for d in unsent:
+            d["sent"] = True
+            d["sent_utc"] = now_s
+            d["sent_timestamp"] = sent_ts
+        sent_hist = [d for d in deferred if d.get("sent")][-50:]
+        save_deferred(sent_hist)
+        return {
+            "flushed_count": len(unsent),
+            "timestamp": sent_ts,
+            "quiet_hours": qh,
+            "remaining_deferred": 0,
+        }
+
+
 def cmd_configure(args: argparse.Namespace) -> int:
     bot = normalize_e164(args.bot_number)
     user = normalize_e164(args.allowed_user_number)
@@ -166,6 +304,16 @@ def cmd_configure(args: argparse.Namespace) -> int:
             "SAFETY BLOCK: --bot-number cannot be your personal Signal number "
             "(registering it would disconnect your phone's Signal app!)."
         )
+    tz_name = (args.timezone or "").strip()
+    if tz_name:
+        ZoneInfo(tz_name)
+    q_start = args.quiet_start.strip()
+    q_end = args.quiet_end.strip()
+    if q_start.lower() not in {"off", "none", "disabled"}:
+        parse_hhmm(q_start)
+    if q_end.lower() not in {"off", "none", "disabled"}:
+        parse_hhmm(q_end)
+
     ensure_state_dir()
     existing = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
     cfg = {
@@ -174,6 +322,9 @@ def cmd_configure(args: argparse.Namespace) -> int:
         "allowed_user_uuid": existing.get("allowed_user_uuid"),
         "bot_given_name": args.bot_given_name,
         "bot_family_name": args.bot_family_name,
+        "timezone": tz_name or existing.get("timezone") or DEFAULT_TIMEZONE,
+        "quiet_hours_start": q_start,
+        "quiet_hours_end": q_end,
         "verified": existing.get("verified", False) if existing.get("bot_number") == bot else False,
         "updated_utc": utc_iso(),
     }
@@ -184,11 +335,35 @@ def cmd_configure(args: argparse.Namespace) -> int:
                 "ok": True,
                 "bot_number_masked": mask_number(bot),
                 "allowed_user_masked": mask_number(user),
+                "timezone": cfg["timezone"],
+                "quiet_hours": f"{cfg['quiet_hours_start']}-{cfg['quiet_hours_end']}",
                 "verified": cfg["verified"],
             },
             indent=2,
         )
     )
+    return 0
+
+
+def cmd_set_quiet_hours(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if args.timezone:
+        ZoneInfo(args.timezone.strip())
+        cfg["timezone"] = args.timezone.strip()
+    if args.start is not None:
+        s = args.start.strip()
+        if s.lower() not in {"off", "none", "disabled"}:
+            parse_hhmm(s)
+        cfg["quiet_hours_start"] = s
+    if args.end is not None:
+        e = args.end.strip()
+        if e.lower() not in {"off", "none", "disabled"}:
+            parse_hhmm(e)
+        cfg["quiet_hours_end"] = e
+    cfg["updated_utc"] = utc_iso()
+    save_config(cfg)
+    qh = evaluate_quiet_hours(cfg)
+    print(json.dumps({"ok": True, "quiet_hours": qh}, indent=2))
     return 0
 
 
@@ -425,10 +600,18 @@ def cmd_bridge_loop(_args: argparse.Namespace) -> int:
                 time.sleep(1.0)
                 continue
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(30.0)
                 sock.connect(str(SOCKET_PATH))
                 buf = b""
                 while True:
-                    chunk = sock.recv(65536)
+                    try:
+                        chunk = sock.recv(65536)
+                    except TimeoutError:
+                        try:
+                            flush_deferred_messages(load_config())
+                        except Exception:
+                            pass
+                        continue
                     if not chunk:
                         break
                     buf += chunk
@@ -459,32 +642,80 @@ def cmd_send(args: argparse.Namespace) -> int:
     if not text:
         raise SystemExit("Refusing to send empty Signal message.")
 
-    if SOCKET_PATH.exists():
-        res = rpc_call("send", {"recipient": [cfg["allowed_user_number"]], "message": text}, timeout=25.0)
-        sent_ts = res.get("timestamp")
-    else:
-        proc = subprocess.run(
-            [str(SIGNAL_CLI), "--scrub-log", "-a", cfg["bot_number"], "send", "-m", text, cfg["allowed_user_number"]],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if proc.returncode != 0:
-            raise SystemExit(f"signal-cli send failed: {proc.stderr or proc.stdout}")
-        sent_ts = int(time.time() * 1000)
+    with state_lock():
+        qh = evaluate_quiet_hours(cfg)
+        inbox = load_inbox()
+        matching_unreplied = [
+            it
+            for it in inbox
+            if not it.get("replied") and (args.mark_all_replied or (args.reply_to and it.get("id") == args.reply_to))
+        ]
+        is_direct_reply = bool((args.reply_to or args.mark_all_replied) and matching_unreplied)
 
-    acked_ids: list[str] = []
-    target_timestamps: list[int] = []
-    if args.reply_to or args.mark_all_replied:
-        with state_lock():
-            inbox = load_inbox()
-            for it in inbox:
-                if not it.get("replied") and (args.mark_all_replied or it.get("id") == args.reply_to):
-                    it["replied"] = True
-                    it["replied_utc"] = utc_iso()
-                    acked_ids.append(it["id"])
-                    if it.get("signal_timestamp"):
-                        target_timestamps.append(int(it["signal_timestamp"]))
+        if qh["active"] and not is_direct_reply and not args.urgent:
+            deferred = load_deferred()
+            existing_unsent = next((d for d in deferred if not d.get("sent") and d.get("text") == text), None)
+            if existing_unsent:
+                qid = existing_unsent["id"]
+                dedup = True
+            else:
+                seq = len(deferred) + 1
+                qid = f"Q-{seq:04d}"
+                deferred.append(
+                    {
+                        "id": qid,
+                        "queued_utc": utc_iso(),
+                        "queued_local": qh["local_time"],
+                        "text": text,
+                        "sent": False,
+                    }
+                )
+                save_deferred(deferred)
+                dedup = False
+            unsent_count = sum(not d.get("sent") for d in deferred)
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "sent": False,
+                        "queued_for_morning": True,
+                        "deduplicated": dedup,
+                        "deferred_id": qid,
+                        "deferred_count": unsent_count,
+                        "quiet_hours": qh,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+
+        # Awake hours (or direct reply / urgent): bundle any pending deferred items if awake & routine
+        deferred = load_deferred()
+        unsent_def = [d for d in deferred if not d.get("sent")] if not qh["active"] and not is_direct_reply else []
+        if unsent_def:
+            parts = list(dict.fromkeys([*(d["text"] for d in unsent_def if d.get("text")), text]))
+            outbound_text = parts[0] if len(parts) == 1 else "\n\n---\n\n".join(parts)
+        else:
+            outbound_text = text
+
+        sent_ts = deliver_raw_signal(cfg, outbound_text)
+        now_s = utc_iso()
+        if unsent_def:
+            for d in unsent_def:
+                d["sent"] = True
+                d["sent_utc"] = now_s
+                d["sent_timestamp"] = sent_ts
+            save_deferred([d for d in deferred if d.get("sent")][-50:])
+
+        acked_ids: list[str] = []
+        target_timestamps: list[int] = []
+        if matching_unreplied:
+            for it in matching_unreplied:
+                it["replied"] = True
+                it["replied_utc"] = now_s
+                acked_ids.append(it["id"])
+                if it.get("signal_timestamp"):
+                    target_timestamps.append(int(it["signal_timestamp"]))
             save_inbox(inbox)
 
     if SOCKET_PATH.exists():
@@ -508,9 +739,13 @@ def cmd_send(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "ok": True,
+                "sent": True,
+                "queued_for_morning": False,
                 "recipient_masked": mask_number(cfg["allowed_user_number"]),
                 "timestamp": sent_ts,
                 "marked_replied": acked_ids,
+                "flushed_deferred_count": len(unsent_def),
+                "quiet_hours": qh,
             },
             indent=2,
         )
@@ -518,11 +753,43 @@ def cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_check(_args: argparse.Namespace) -> int:
+def cmd_flush_deferred(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    res = flush_deferred_messages(cfg, force=args.force)
+    print(json.dumps({"ok": True, **res}, indent=2))
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    flush_res = {"flushed_count": 0, "quiet_hours": None, "remaining_deferred": 0}
+    if CONFIG_PATH.exists():
+        cfg = load_config()
+        if not args.no_flush:
+            flush_res = flush_deferred_messages(cfg)
+        else:
+            with state_lock():
+                unsent_def = sum(not d.get("sent") for d in load_deferred())
+            flush_res = {
+                "flushed_count": 0,
+                "quiet_hours": evaluate_quiet_hours(cfg),
+                "remaining_deferred": unsent_def,
+            }
     with state_lock():
         inbox = load_inbox()
     pending = [it for it in inbox if not it.get("replied")]
-    print(json.dumps({"ok": True, "pending_count": len(pending), "pending": pending}, indent=2))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "pending_count": len(pending),
+                "pending": pending,
+                "flushed_deferred_count": flush_res["flushed_count"],
+                "deferred_count": flush_res["remaining_deferred"],
+                "quiet_hours": flush_res["quiet_hours"],
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -545,6 +812,8 @@ def cmd_status(_args: argparse.Namespace) -> int:
     configured = CONFIG_PATH.exists()
     cfg = load_config() if configured else {}
     pending = [it for it in load_inbox() if not it.get("replied")] if configured else []
+    deferred_unsent = sum(not d.get("sent") for d in load_deferred()) if configured else 0
+    qh = evaluate_quiet_hours(cfg) if configured else None
     svc = subprocess.run(
         ["systemctl", "--user", "is-active", "herd-signal-daemon.service", "herd-signal-bridge.service"],
         capture_output=True,
@@ -562,6 +831,8 @@ def cmd_status(_args: argparse.Namespace) -> int:
                 "socket_exists": SOCKET_PATH.exists(),
                 "service_states": states,
                 "pending_messages": len(pending),
+                "deferred_messages": deferred_unsent,
+                "quiet_hours": qh,
             },
             indent=2,
         )
@@ -578,7 +849,16 @@ def build_parser() -> argparse.ArgumentParser:
     s_cfg.add_argument("--allowed-user-number", required=True, help="Single allowlisted personal Signal number")
     s_cfg.add_argument("--bot-given-name", default="Runai")
     s_cfg.add_argument("--bot-family-name", default="(Herd)")
+    s_cfg.add_argument("--timezone", help=f"IANA timezone for quiet hours (default: {DEFAULT_TIMEZONE})")
+    s_cfg.add_argument("--quiet-start", default=DEFAULT_QUIET_START, help="Quiet hours start HH:MM (or 'off')")
+    s_cfg.add_argument("--quiet-end", default=DEFAULT_QUIET_END, help="Quiet hours end HH:MM (or 'off')")
     s_cfg.set_defaults(func=cmd_configure)
+
+    s_qh = sub.add_parser("set-quiet-hours", help="Configure local quiet hours window and IANA timezone.")
+    s_qh.add_argument("--timezone", help="IANA timezone (e.g. America/New_York)")
+    s_qh.add_argument("--start", help="Start time HH:MM in 24-hour local time (or 'off')")
+    s_qh.add_argument("--end", help="End time HH:MM in 24-hour local time (or 'off')")
+    s_qh.set_defaults(func=cmd_set_quiet_hours)
 
     s_reg = sub.add_parser("register", help="Request SMS or voice OTP from Signal for the bot number.")
     s_reg.add_argument("--voice", action="store_true", help="Request voice call OTP instead of SMS")
@@ -600,9 +880,15 @@ def build_parser() -> argparse.ArgumentParser:
     s_send.add_argument("--message", required=True, help="Message body")
     s_send.add_argument("--reply-to", help="Mark specific S-NNNN message replied and react ✅")
     s_send.add_argument("--mark-all-replied", action="store_true", help="Mark all pending Signal messages replied")
+    s_send.add_argument("--urgent", action="store_true", help="Bypass quiet hours for genuine emergencies only")
     s_send.set_defaults(func=cmd_send)
 
-    s_chk = sub.add_parser("check", help="Check pending unreplied Signal messages.")
+    s_fl = sub.add_parser("flush-deferred", help="Flush queued overnight messages if outside quiet hours.")
+    s_fl.add_argument("--force", action="store_true", help="Flush even if quiet hours are currently active")
+    s_fl.set_defaults(func=cmd_flush_deferred)
+
+    s_chk = sub.add_parser("check", help="Check pending unreplied Signal messages (and flush due morning queue).")
+    s_chk.add_argument("--no-flush", action="store_true", help="Do not auto-flush deferred morning messages")
     s_chk.set_defaults(func=cmd_check)
 
     s_wait = sub.add_parser("wait-next", help="Block until an allowlisted Signal message arrives, then exit 0.")

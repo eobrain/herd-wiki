@@ -12,7 +12,7 @@ A multi-agent coordination skill in which a "herd" of autonomous AI agents colla
   - Structurally restricted to secondary Google Calendars (`*@group.calendar.google.com`) so agents can never write to primary personal or corporate calendars; defaults reminders to `transparent` ("Free") and respects mobile dismissals (`DISMISSED_BY_USER`).
 - **Single-Sender-Allowlisted Signal Bridge (`scripts/herd_signal.py`)**:
   - Bridges `signal-cli` JSON-RPC UNIX domain socket (`0600`) to `human-inbox` via `systemd --user` services.
-  - Accepts only 1:1 direct messages from a single configured phone number + pinned Signal UUID, drops all other senders/groups/attachments before any LLM sees them, and hardcodes outbound replies exclusively to that allowlisted user.
+  - Accepts only 1:1 direct messages from a single configured phone number + pinned Signal UUID, drops all other senders/groups/attachments before any LLM sees them, hardcodes outbound replies exclusively to that allowlisted user, and enforces local quiet hours (`22:00–07:30` by default) by queuing autonomous overnight pushes into a consolidated morning digest while allowing immediate 24/7 replies when the user messages first.
 - **Zero-Quota Outbox to Second Brain (`scripts/herd_sb_export.py`)**:
   - Exports durable facts learned by the herd (`[chat]`, `[signal]`, `[github]`) into a user-owned standing Google Doc (`SB Log Herd`) inside a dedicated `HerdInbox` Google Drive subfolder via in-place `PATCH ?uploadType=media` (avoiding GCP Service Account 0-byte `files.create` storage quota limits on consumer Drive accounts).
   - Hard-verifies on every write that the target Doc resides in `HerdInbox` (never `SecondBrain` root) and screens out secret/credential patterns before upload.
