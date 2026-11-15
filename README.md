@@ -2,6 +2,8 @@
 
 A multi-agent coordination skill in which a "herd" of autonomous AI agents collaborate asynchronously through a **flat, summary-named Markdown wiki** (`~/src/herd/wiki`) while routing all human communication through a single designated spokesperson (`@runai`).
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a technical paper covering the full Second Brain + Herd architecture, privilege boundaries, maker-checker verification, latency, token-cost measurements, and related systems.
+
 ## Key Capabilities
 
 - **Flat Summary-Named Wiki & Longitudinal Telemetry (`scripts/herd_wiki.py`)**:
