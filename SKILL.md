@@ -14,7 +14,7 @@ description: >-
 
 You are operating as part of a **herd of collaborative agents** whose shared mission is to be as helpful as possible to the user through a flat Markdown blackboard and knowledge base at `~/src/herd/wiki`.
 
-Use the concurrency-safe helper scripts [herd_wiki.py](./scripts/herd_wiki.py) (indexing, unique name registration, staggered random-minute cron setup, fast wakeup triage `quick-check`, human inbox/outbox coordination, Second Brain 6-hour sync leases, atomic task claiming, link-safe file renames, and validation), [herd_calendar.py](./scripts/herd_calendar.py) (syncing vetted appointments, deadlines, and deferred reminders onto the dedicated secondary `"Herd"` Google Calendar), [herd_signal.py](./scripts/herd_signal.py) (single-sender-allowlisted Signal bridge for `@runai`), and [herd_sb_export.py](./scripts/herd_sb_export.py) (exporting durable Herd facts into `HerdInbox/SB Log Herd` for nightly Second Brain consolidation). Read [wiki-conventions.md](./references/wiki-conventions.md) for filename patterns, calendar rules, collaboration templates, and safety examples.
+Use the concurrency-safe helper scripts [herd_wiki.py](./scripts/herd_wiki.py) (indexing, unique name registration, staggered random-minute cron setup, fast wakeup triage `quick-check`, human inbox/outbox coordination, Second Brain 6-hour sync leases, atomic task claiming, link-safe file renames, and validation), [herd_calendar.py](./scripts/herd_calendar.py) (syncing vetted appointments, deadlines, and deferred reminders onto the dedicated secondary `"Herd"` Google Calendar), [herd_signal.py](./scripts/herd_signal.py) (single-sender-allowlisted Signal bridge for `@runai`), [herd_sb_export.py](./scripts/herd_sb_export.py) (exporting durable Herd facts into `HerdInbox/SB Log Herd` for nightly Second Brain consolidation), and [herd_claude_worker.py](./scripts/herd_claude_worker.py) (zero-idle-token `systemd --user` hourly runner for Claude Code herd workers). Read [wiki-conventions.md](./references/wiki-conventions.md) for filename patterns, calendar rules, collaboration templates, and safety examples.
 
 ---
 
@@ -63,9 +63,10 @@ Agents must **not** all share `0 */6 * * *`. Instead, each worker agent wakes up
    ```bash
    python3 ~/src/herd/.agents/skills/herd-wiki/scripts/herd_wiki.py random-cron --agent <yourname>
    ```
-2. **Register your `schedule` cron (and replace any legacy `0 */6 * * *` cron)**:
-   - Run `manage_task` (`Action: "list"`). If an older `0 */6 * * *` schedule or duplicate cron task is running, **cancel (`kill`) it** first.
-   - Call `schedule` once with `CronExpression: "<M> * * * *"`, `ExactTiming: false`, and a concise wakeup prompt instructing yourself to run `herd_wiki.py quick-check --agent <yourname>` and go straight back to waiting if nothing is new.
+2. **Register your hourly wakeup schedule (unless managed externally by `herd_claude_worker.py` `systemd --user` timer)**:
+   - **Antigravity sessions**: Run `manage_task` (`Action: "list"`), kill any older `0 */6 * * *` or duplicate cron task, and call `schedule` once with `CronExpression: "<M> * * * *"` and `ExactTiming: false`.
+   - **Claude Code interactive / `--bg` sessions**: Check `CronList`, delete any duplicate schedule via `CronDelete`, and call `CronCreate` with `"<M> * * * *"` to run `herd_wiki.py quick-check --agent <yourname>` hourly.
+   - **`systemd --user` zero-idle-token workers (`herd_claude_worker.py`)**: Your `herd-claude-<yourname>.timer` already runs `quick-check` in Python every hour at minute `<M>` and only invokes `claude -p` when `"action_needed": true` — do **not** create an in-session cron.
 
 ---
 

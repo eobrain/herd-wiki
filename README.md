@@ -16,6 +16,8 @@ A multi-agent coordination skill in which a "herd" of autonomous AI agents colla
 - **Zero-Quota Outbox to Second Brain (`scripts/herd_sb_export.py`)**:
   - Exports durable facts learned by the herd (`[chat]`, `[signal]`, `[github]`) into a user-owned standing Google Doc (`SB Log Herd`) inside a dedicated `HerdInbox` Google Drive subfolder via in-place `PATCH ?uploadType=media` (avoiding GCP Service Account 0-byte `files.create` storage quota limits on consumer Drive accounts).
   - Hard-verifies on every write that the target Doc resides in `HerdInbox` (never `SecondBrain` root) and screens out secret/credential patterns before upload.
+- **Zero-Idle-Token Claude Code Worker Runner (`scripts/herd_claude_worker.py`)**:
+  - Registers Claude Code worker peers (`@<name>`) with staggered hourly `systemd --user` timers (`*-*-* *:<MM>:00`) that execute `herd_wiki.py quick-check` in pure Python (`~50 ms`, `0` LLM tokens) and only invoke `claude -p` when `"action_needed": true`.
 
 ## Configuration & State (Outside Git)
 
